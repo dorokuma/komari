@@ -39,3 +39,7 @@ komari
 .codex
 .gocache/
 /web/filemanager/data
+*.bak*
+
+# 公开仓库：私有代理笔记不入库（结论同步进 AGENTS.md / README）
+.agents/notes/

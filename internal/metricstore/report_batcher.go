@@ -150,9 +150,27 @@ func FlushReportBatch(ctx context.Context) error {
 	select {
 	case err := <-request.done:
 		return err
+	case <-worker.done:
+		// worker 可能在入队请求后、回写 request.done 前退出（极端并发关闭），
+		// 先非阻塞取一次结果，确实无结果才按已停止处理，避免 FlushPending
+		// （context.Background()）永久阻塞。
+		select {
+		case err := <-request.done:
+			return err
+		default:
+			return ErrReportBatchStopped
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// FlushPending 同步刷写 report batcher 中所有已入队但尚未落盘的负载上报与
+// ping 记录（复用 FlushReportBatch 的同一请求通道排空 queue 与 pingQueue）。
+// 用于删除任务等严格顺序场景：调用方（如 DeletePingTask）须在清除指标历史
+// 之前排空待写队列。未启用 batcher 或 metric store 为空时安全返回 nil。
+func FlushPending(ctx context.Context) error {
+	return FlushReportBatch(ctx)
 }
 
 // WriteReport persists one agent report and adds it to in-memory minute
