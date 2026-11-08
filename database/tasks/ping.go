@@ -4,16 +4,37 @@ import (
 	"context"
 	"slices"
 	"sort"
+	"sync"
 
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
+	"github.com/komari-monitor/komari/internal/localping"
 	"github.com/komari-monitor/komari/internal/metricstore"
 	"github.com/komari-monitor/komari/utils"
 	"gorm.io/gorm"
 )
 
+// pingTaskMu 串行化全部 PingTask 变更与调度重载入口：删除时
+// CancelTasks→Flush→删行→提交墓碑→重载的完整序列与其它入口的重载
+// （读库→AllowTasks→重建调度表）互斥，消除「锁外读旧快照后反写调度表与
+// AllowTasks」的竞态窗口。
+var pingTaskMu sync.Mutex
+
+// reloadPingScheduleLocked 在持有 pingTaskMu 期间读取任务表并重载调度，
+// 必须与调用方在同一临界区内执行，保证快照与 AllowTasks/墓碑决策一致。
+func reloadPingScheduleLocked() error {
+	pingTasks, err := GetAllPingTasks()
+	if err != nil {
+		return err
+	}
+	return utils.ReloadPingSchedule(pingTasks)
+}
+
 // AddPingTask 创建延迟监测任务。defaultOn 表示新加入的服务器是否自动开启此监测。
 func AddPingTask(clients []string, defaultOn bool, name string, target, task_type string, interval int) (uint, error) {
+	pingTaskMu.Lock()
+	defer pingTaskMu.Unlock()
+
 	db := dbcore.GetDBInstance()
 	normalizedClients := normalizePingClients(models.StringArray(clients))
 	task := models.PingTask{
@@ -34,11 +55,29 @@ func AddPingTask(clients []string, defaultOn bool, name string, target, task_typ
 	if err != nil {
 		return 0, err
 	}
-	ReloadPingSchedule()
+	// SQLite 主键（非 AUTOINCREMENT）可能被复用：立即解除该 Id 的删除标
+	// 记放行新任务；删除前旧世代残余协程已由 taskEpoch 不匹配挡在写点
+	// 路径之外。
+	localping.Default.AllowTasks([]uint{task.Id})
+	_ = reloadPingScheduleLocked()
 	return task.Id, nil
 }
 
 func DeletePingTask(id []uint) error {
+	pingTaskMu.Lock()
+	defer pingTaskMu.Unlock()
+
+	// 删除前的同步栅栏：推进该批任务世代号、递增在途删除引用计数并取消
+	// 全部在途探测。finish(committed) 由 sync.Once 保护：finish(true) 立
+	// 墓碑（taskDeleted），finish(false) 仅释放引用计数、绝不触碰既有
+	// 墓碑（并发重复删除报 ErrRecordNotFound 早退时不会误清）。
+	finish := localping.Default.CancelTasks(id)
+	defer func() { finish(false) }()
+
+	// 排空 report batcher 中已入队未落盘的记录，确保接下来删除的是完整历史。
+	if err := metricstore.FlushPending(context.Background()); err != nil {
+		return err
+	}
 	// The metric store is independent from the main database, so clean it first
 	// to avoid leaving history that can no longer be addressed through the task.
 	if err := DeletePingRecords(id); err != nil {
@@ -50,12 +89,20 @@ func DeletePingTask(id []uint) error {
 	if result.RowsAffected == 0 {
 		return gorm.ErrRecordNotFound
 	}
-	ReloadPingSchedule()
-	return result.Error
+	if result.Error != nil {
+		return result.Error
+	}
+	// 删行成功：提交墓碑（sync.Once 生效，defer 的 finish(false) 自动空转），
+	// 随后在持锁状态下重载调度，杜绝并发 ReloadPingSchedule 反写旧快照。
+	finish(true)
+	return reloadPingScheduleLocked()
 }
 
 // EditPingTask 批量更新延迟监测任务配置。
 func EditPingTask(tasks []*models.PingTask) error {
+	pingTaskMu.Lock()
+	defer pingTaskMu.Unlock()
+
 	db := dbcore.GetDBInstance()
 	for _, task := range tasks {
 		task.Clients = normalizePingClients(task.Clients)
@@ -73,8 +120,7 @@ func EditPingTask(tasks []*models.PingTask) error {
 			return gorm.ErrRecordNotFound
 		}
 	}
-	ReloadPingSchedule()
-	return nil
+	return reloadPingScheduleLocked()
 }
 
 // normalizePingClients 保持 clients 字段序列化为 JSON 数组，避免空值变成 null。
@@ -109,6 +155,9 @@ func UpdatePingTaskOrder(order map[uint]int) error {
 		return nil
 	}
 
+	pingTaskMu.Lock()
+	defer pingTaskMu.Unlock()
+
 	db := dbcore.GetDBInstance()
 	err := db.Transaction(func(tx *gorm.DB) error {
 		// Validate all ids before changing any weights. The update response is
@@ -138,8 +187,7 @@ func UpdatePingTaskOrder(order map[uint]int) error {
 	if err != nil {
 		return err
 	}
-	ReloadPingSchedule()
-	return nil
+	return reloadPingScheduleLocked()
 }
 
 // ping 记录已完全迁移到 metric store（指标 ping.latency_ms），运行期读写全部走
@@ -158,15 +206,16 @@ func DeleteAllPingRecords() error {
 }
 
 func ReloadPingSchedule() error {
-	pingTasks, err := GetAllPingTasks()
-	if err != nil {
-		return err
-	}
-	return utils.ReloadPingSchedule(pingTasks)
+	pingTaskMu.Lock()
+	defer pingTaskMu.Unlock()
+	return reloadPingScheduleLocked()
 }
 
 // AddDefaultOnClientUUID 在新客户端注册后，把该 UUID 追加到所有 default_on=true 的任务的 clients 中（去重）。
 func AddDefaultOnClientUUID(uuid string) error {
+	pingTaskMu.Lock()
+	defer pingTaskMu.Unlock()
+
 	db := dbcore.GetDBInstance()
 	var tasks []models.PingTask
 	if err := db.Where("all_clients = ?", true).Find(&tasks).Error; err != nil {
@@ -185,7 +234,7 @@ func AddDefaultOnClientUUID(uuid string) error {
 		changed = true
 	}
 	if changed {
-		return ReloadPingSchedule()
+		return reloadPingScheduleLocked()
 	}
 	return nil
 }

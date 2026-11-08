@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - dev
+      - main
   workflow_dispatch:
 
 concurrency:
@@ -14,11 +15,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  # 前端嵌入产物（web/public/defaultTheme/*）不入 git，go test/vet/build 都依赖它，
+  # 因此测试 job 先构建 default theme，再经 make check 唯一入口校验。
+  build-frontend:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Build frontend artifact
+        uses: ./.github/actions/build-frontend
+        with:
+          artifact-name: komari-frontend
+
+  test:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # make check 的 gofmt 增量检查需要 upstream/main 的完整 merge-base
+          fetch-depth: 0
+
+      - name: Restore frontend artifact
+        uses: ./.github/actions/restore-frontend
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -26,32 +47,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Download dependencies
-        run: go mod download
-
-      # NOTE: the repository stores Go sources with CRLF line endings, which
-      # gofmt normalises to LF, so "gofmt -l" currently lists ~327 files. Until
-      # that is normalised repo-wide this step is advisory only; flip it to a
-      # hard failure once the tree is clean.
-      - name: Formatting report (advisory)
+      - name: Add upstream remote
         run: |
-          count=$(gofmt -l . | grep -v '^web/node_modules' | wc -l)
-          echo "gofmt reports $count file(s) needing formatting."
-          gofmt -l . | grep -v '^web/node_modules' | head -20 || true
+          git remote add upstream https://github.com/komari-monitor/komari.git || true
+          git fetch upstream main
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test ./... -count=1 -timeout 10m
-
-      - name: Test (repeat for isolation)
-        run: go test ./... -count=2 -shuffle=on -timeout 15m
-
-      - name: Race detector
-        run: go test -race ./pkg/metric/ ./internal/metricstore/ ./internal/plugin/ ./web/connection/ ./web/api/terminal/ -count=1 -timeout 15m
-
-      - name: Coverage
-        run: |
-          go test ./... -count=1 -coverpkg=./... -coverprofile=coverage.out -timeout 15m
-          go tool cover -func=coverage.out | tail -1
+      # 唯一检查入口（与本地一致）：增量 gofmt 零差异 + vet + test + race + build-check。
+      - name: Run checks
+        run: make check

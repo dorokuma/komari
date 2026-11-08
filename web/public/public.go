@@ -21,6 +21,12 @@ var PublicFS embed.FS
 //go:embed defaultTheme/dist.tar.zst
 var embeddedDistArchive []byte
 
+//go:embed local_ping_selector.js
+var localPingSelectorJS []byte
+
+// LocalPingSelectorScriptTag 是注入 /admin 页面的探测方式选择器脚本标签。
+const LocalPingSelectorScriptTag = `<script src="/__komari_local_ping.js" defer></script>`
+
 // 常量定义
 const (
 	DataDir            = "./data"
@@ -80,6 +86,22 @@ func replaceHTMLLanguage(htmlStr, language string) string {
 
 func stripServiceWorkerRegistration(html string) string {
 	return strings.ReplaceAll(html, `<script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script>`, "")
+}
+
+// injectLocalPingSelector 在 </body> 前注入本机探测方式选择器脚本；
+// 页面无 </body> 或已注入时保持不变。
+func injectLocalPingSelector(htmlStr string) string {
+	if strings.Contains(htmlStr, "/__komari_local_ping.js") {
+		return htmlStr
+	}
+	idx := strings.LastIndex(htmlStr, "</body>")
+	if idx < 0 {
+		idx = strings.LastIndex(htmlStr, "</BODY>")
+	}
+	if idx >= 0 {
+		return htmlStr[:idx] + LocalPingSelectorScriptTag + htmlStr[idx:]
+	}
+	return htmlStr
 }
 
 // isSafePath 验证路径是否在指定的基础目录内，防止路径穿透攻击
@@ -223,6 +245,11 @@ func static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc), force
 		if language, err := c.Cookie(LanguageCookieName); err == nil {
 			htmlStr = replaceHTMLLanguage(htmlStr, language)
 		}
+		// /admin 页面（且非受限恢复监听）注入本机正向探测方式选择器脚本；
+		// 精确匹配 /admin 或 /admin/ 子路径，避免误注入 /adminfoo 等前台页面。
+		if !forceDefaultTheme && (reqPath == "/admin" || strings.HasPrefix(reqPath, "/admin/")) {
+			htmlStr = injectLocalPingSelector(htmlStr)
+		}
 
 		// 如果不替换，保留系统内置页面内容，仅同步 html lang。
 		if !shouldReplace {
@@ -242,6 +269,12 @@ func static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc), force
 	}
 
 	// ================= 路由定义 =================
+	// 0. /admin 探测方式选择器脚本（仅静态 JS 资源，注入与否由 serveIndex 决定）
+	r.GET("/__komari_local_ping.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", localPingSelectorJS)
+	})
+
 	// 1. Favicon 优先策略
 	r.GET("/favicon.ico", func(c *gin.Context) {
 		// 优先：./data/favicon.ico
