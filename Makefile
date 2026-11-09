@@ -23,13 +23,13 @@ fmt-check:
 		echo "fmt-check: 缺少 upstream/main 或上游基线 commit $(UPSTREAM_BASE_SHA)，无法确定增量范围" >&2; exit 1; \
 	fi; \
 	files=$$( { git diff --name-only --diff-filter=d "$$base" -- '*.go'; \
-	             git ls-files --others --exclude-standard '*.go'; } | sort -u ); \
+	             git ls-files --others --exclude-standard '*.go'; } | sort -u ) || exit $$?; \
 	if [ -z "$$files" ]; then \
 		echo "fmt-check: 无相对 $$base 改动的 .go 文件"; \
 	else \
 		bad=""; \
 		for f in $$files; do \
-			out=$$(gofmt -l "$$f"); \
+			out="$$(gofmt -l "$$f")" || exit $$?; \
 			[ -n "$$out" ] && bad="$$bad $$out"; \
 		done; \
 		if [ -n "$$bad" ]; then \
@@ -52,7 +52,7 @@ race:
 # 编译校验：编译到临时文件并立即删除，不在工作树残留二进制
 # （依赖 web/public/defaultTheme/{dist.tar.zst,komari-theme.json} 嵌入产物）。
 build-check:
-	@tmp="$$(mktemp -u /tmp/komari-build-check.XXXXXX)"; \
+	@tmp="$$(mktemp -u /tmp/komari-build-check.XXXXXX)" || exit $$?; \
 	go build -o "$$tmp" . && rm -f "$$tmp"
 
 # 编译二进制（须先备好 web/public/defaultTheme/{dist.tar.zst,komari-theme.json}）
