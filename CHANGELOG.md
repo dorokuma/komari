@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1-localping.1] - 2026-11-09
+
 ### Added
 
 - L2 开发基线：`AGENTS.md`、`Makefile`（唯一检查入口 `make check`）、本文件；CI Test workflow 接入 `make check`。
@@ -16,3 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `Makefile` 的 `fmt-check` 基线引用优先取 `upstream/main`，不存在时回退到上游分叉基线 commit，离线隔离 clone（origin 已移除）也能跑 `make check`；`RACE_PKGS` 新增 `internal/localping`、`utils` 与 `database/tasks`；`make check` 增加 `build-check`（编译二进制到临时文件后删除，保证可编译性），CI 严格以 `make check` 为唯一检查入口（移除独立 Coverage 跑测步骤）。
+
+[Unreleased]: https://github.com/dorokuma/komari/compare/1.6.1-localping.1...HEAD
+[1.6.1-localping.1]: https://github.com/dorokuma/komari/compare/1.6.1...1.6.1-localping.1
