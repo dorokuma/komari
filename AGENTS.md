@@ -33,6 +33,8 @@
 - 运行时隔离红线：严禁触碰 `/root/workspace/komari` 生产实例（密钥、token、SQLite 数据库、缓存、运行中的二进制），一律不得读写。
 - 与上游有意分歧的记录位置：公开仓——结论同步写 `AGENTS.md` / README，或本地 `.agents/notes/fork-delta.md`（`.agents/notes/` 已 gitignore，不入库）。
 - Git 仓库内只在本仓 worktree 改动，不碰主目录 `/root/workspace/komari-server`。
+- `localping` 维护红线——选择器前后端解析对等：`internal/localping.ParseTarget` 与 `web/public/local_ping_selector.js` 的 `detectMode` 共享本机选择器语法规则（RFC 3986 顶层 scheme、`/?#` 截断、`@ipv4`/`@ipv6` 前缀与方括号闭合校验）；修改任一端必须同步另一端并更新 `TestLocalPingSelectorDOMBehavior` 与 `localping_test.go`。
+- `localping` 维护红线——自报公网 IP 反射放大防线：`internal/localping` 直接探测节点自报公网 IP（`ValidatePublicProbeIP` 仅排除私网/保留地址，无法区分第三方公网 IP）；改动探测调度时必须维持单次 3s 超时、HTTP 禁重定向（`http.ErrUseLastResponse`）、全局 `MaxConcurrentLocalProbes = 32` 与单 `(taskID, clientUUID)` 在途去重四道防线。
 
 ## 架构分层（指针）
 
