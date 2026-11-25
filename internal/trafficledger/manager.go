@@ -127,6 +127,12 @@ func (m *Manager) SetDefaultTimezone(timezone string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stopped {
+		// A stopped manager must stay byte-identical with its final flush:
+		// refreshing cycle windows here would dirty rows that nothing will
+		// ever persist again.
+		return ErrManagerStopped
+	}
 	m.defaultTimezone = timezone
 	now := time.Now().UTC()
 	for _, entry := range m.entries {
@@ -236,6 +242,15 @@ func (m *Manager) ResolveDisplay(uuid string, rawUp, rawDown int64) DisplayTraff
 	entry = m.entries[uuid]
 	if entry == nil || entry.row.Mode == ModeAgent {
 		return DisplayTraffic{Up: max(rawUp, 0), Down: max(rawDown, 0), Mode: ModeAgent}
+	}
+	if m.stopped {
+		// After Shutdown the ledger must stay byte-identical with the final
+		// flush: a lazy rollover here would mark rows dirty and queue closures
+		// that nothing ever persists again, silently dropping accepted state.
+		// The status display degrades to a pure in-memory projection instead.
+		projection := ledgerEntry{row: cloneLedger(entry.row)}
+		_, _ = refreshEntryCycle(&projection, m.defaultTimezone, now)
+		return displayFromRow(projection.row)
 	}
 	_ = m.refreshAutomaticCycleLocked(entry, now)
 	return displayFromRow(entry.row)
@@ -776,20 +791,42 @@ func (m *Manager) assignCycleWindowLocked(row *models.ClientTrafficLedger, now t
 	return nil
 }
 
+// refreshAutomaticCycleLocked applies refreshEntryCycle to the live entry and
+// queues any produced cycle-close snapshot for the next flush.
 func (m *Manager) refreshAutomaticCycleLocked(entry *ledgerEntry, at time.Time) error {
+	closeSnap, err := refreshEntryCycle(entry, m.defaultTimezone, at)
+	if err != nil {
+		return err
+	}
+	if closeSnap != nil {
+		m.nextClosure++
+		m.closures = append(m.closures, queuedClose{
+			sequence: m.nextClosure,
+			snapshot: *closeSnap,
+		})
+	}
+	return nil
+}
+
+// refreshEntryCycle advances the entry's automatic cycle window, queuing
+// nothing: it only mutates the given entry and returns any rollover close
+// snapshot for the caller to handle. Because it never touches manager state,
+// the same function backs the read-only post-shutdown display projection on
+// a scratch entry copy.
+func refreshEntryCycle(entry *ledgerEntry, defaultTimezone string, at time.Time) (*ClosedCycleSnapshot, error) {
 	row := &entry.row
 	if !isAutomaticMode(row.Mode) {
-		return nil
+		return nil, nil
 	}
-	start, end, err := cycleBoundsWithDefault(configFromModel(*row), m.defaultTimezone, at)
+	start, end, err := cycleBoundsWithDefault(configFromModel(*row), defaultTimezone, at)
 	if err != nil || start == nil || end == nil {
-		return err
+		return nil, err
 	}
 	if row.CycleStartAt == nil {
 		row.CycleStartAt, row.CycleEndAt = start, end
 		row.UpdatedAt = at.UTC()
 		markDirty(entry)
-		return nil
+		return nil, nil
 	}
 	if start.After(row.CycleStartAt.UTC()) {
 		// A boundary shift caused purely by a timezone configuration change
@@ -801,32 +838,32 @@ func (m *Manager) refreshAutomaticCycleLocked(entry *ledgerEntry, at time.Time) 
 			row.CycleStartAt, row.CycleEndAt = cloneTime(start), cloneTime(end)
 			row.UpdatedAt = at.UTC()
 			markDirty(entry)
-			return nil
+			return nil, nil
 		}
 		rebaseline := row.RawLastAt == nil || at.Sub(row.RawLastAt.UTC()) > crossCycleGapLimit
-		m.rolloverEntryLocked(entry, start, end, rebaseline)
-		return nil
+		closeSnap := rolloverEntry(entry, start, end, rebaseline)
+		return closeSnap, nil
 	}
 	if !start.Equal(row.CycleStartAt.UTC()) || row.CycleEndAt == nil || !end.Equal(row.CycleEndAt.UTC()) {
 		row.CycleStartAt, row.CycleEndAt = start, end
 		row.UpdatedAt = at.UTC()
 		markDirty(entry)
 	}
-	return nil
+	return nil, nil
 }
 
-func (m *Manager) rolloverEntryLocked(entry *ledgerEntry, start, end *time.Time, rebaseline bool) {
+// rolloverEntry resets the entry into a fresh cycle and returns the close
+// snapshot for the cycle it left behind, or nil when there was nothing to close.
+func rolloverEntry(entry *ledgerEntry, start, end *time.Time, rebaseline bool) *ClosedCycleSnapshot {
 	row := &entry.row
+	var closeSnap *ClosedCycleSnapshot
 	if row.CycleStartAt != nil {
 		closeAt := start.UTC()
 		if row.CycleEndAt != nil && row.CycleEndAt.Before(closeAt) {
 			closeAt = row.CycleEndAt.UTC()
 		}
-		m.nextClosure++
-		m.closures = append(m.closures, queuedClose{
-			sequence: m.nextClosure,
-			snapshot: closeSnapshot(*row, closeAt, CloseReasonAutoRollover),
-		})
+		snap := closeSnapshot(*row, closeAt, CloseReasonAutoRollover)
+		closeSnap = &snap
 	}
 	clearCycleCounters(row)
 	row.CycleStartAt, row.CycleEndAt = cloneTime(start), cloneTime(end)
@@ -835,6 +872,7 @@ func (m *Manager) rolloverEntryLocked(entry *ledgerEntry, start, end *time.Time,
 	}
 	row.UpdatedAt = time.Now().UTC()
 	markDirty(entry)
+	return closeSnap
 }
 
 func (m *Manager) snapshotClosuresLocked(extra []ClosedCycleSnapshot) ([]ClosedCycleSnapshot, uint64) {
