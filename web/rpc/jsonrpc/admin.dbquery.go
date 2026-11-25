@@ -336,14 +336,17 @@ func collectDatabaseRows(rows *sql.Rows, limit int) ([]string, [][]any, bool, er
 }
 
 // redactSQLStringLiterals is a fail-closed lexical scanner for SQL audit
-// previews. It redacts single-quoted, double-quoted, and PostgreSQL
-// dollar-quoted literals while honoring SQL comments, quote doubling, backslash
-// escapes, and dollar-quote tags. Comments are retained only as redacted
-// placeholders because an apostrophe inside a comment must never flip quote
-// parity. Dialect-ambiguous constructs — a MySQL '#' line comment, an
-// odd backslash run before a quote, or a bracket identifier carrying
-// quote-like content — downgrade the whole statement preview rather than
-// risking plaintext credential disclosure.
+// previews. It redacts single-quoted and double-quoted literals while
+// honoring SQL comments, quote doubling, and backslash escapes. Comments are
+// retained only as redacted placeholders because an apostrophe inside a
+// comment must never flip quote parity. Dialect-ambiguous constructs — a
+// MySQL '#' line comment, an odd backslash run before a quote, a nested or
+// executable block comment, a non-positional dollar construct (dollar
+// quotes, '$' identifiers, Tcl-style bind parameters), a MySQL '--' without
+// trailing whitespace, a bare carriage return inside a line comment, or a
+// backtick/bracket identifier carrying quote-like content — downgrade the
+// whole statement preview rather than risking plaintext credential
+// disclosure.
 func redactSQLStringLiterals(statement string) string {
 	var out strings.Builder
 	out.Grow(len(statement))
@@ -351,8 +354,11 @@ func redactSQLStringLiterals(statement string) string {
 		ch := statement[i]
 		switch {
 		case ch == '-' && i+1 < len(statement) && statement[i+1] == '-':
+			newline, next, ok := scanSQLLineCommentEnd(statement, i+2)
+			if !ok {
+				return "[REDACTED]"
+			}
 			out.WriteString("--[REDACTED]")
-			newline, next := scanSQLLineCommentEnd(statement, i+2)
 			if newline {
 				out.WriteByte('\n')
 			}
@@ -392,11 +398,13 @@ func redactSQLStringLiterals(statement string) string {
 			}
 			out.WriteString(statement[i:next])
 			i = next
-		case ch == '0' && scanSQLHexLiteralEnd(statement, i) > 0:
-			// MySQL unquoted hexadecimal literals (0x...) are byte-string value
-			// carriers and must be redacted like quoted literals.
-			out.WriteString("0x[REDACTED]")
-			i = scanSQLHexLiteralEnd(statement, i)
+		case ch == '0' && scanSQLBinaryOrHexLiteralEnd(statement, i) > 0:
+			// MySQL unquoted binary and hexadecimal literals (0b..., 0x...) are
+			// byte-string value carriers and must be redacted like quoted
+			// literals.
+			out.WriteString(statement[i : i+2])
+			out.WriteString("[REDACTED]")
+			i = scanSQLBinaryOrHexLiteralEnd(statement, i)
 		case ch == '$':
 			written, next, ok := scanSQLDollarConstruct(statement, i)
 			if !ok {
@@ -404,6 +412,15 @@ func redactSQLStringLiterals(statement string) string {
 			}
 			out.WriteString(written)
 			i = next
+		case ch == ':' || ch == '@':
+			// Tcl-style SQLite bind parameters (:x, @x) fold a following
+			// parenthesized suffix into the variable token, hiding string
+			// openers from other dialects.
+			if hasUnsafeSQLiteVarParen(statement, i) {
+				return "[REDACTED]"
+			}
+			out.WriteByte(ch)
+			i++
 		default:
 			out.WriteByte(ch)
 			i++
@@ -413,52 +430,133 @@ func redactSQLStringLiterals(statement string) string {
 }
 
 // scanSQLLineCommentEnd scans from the byte just after a "--" opener to the
-// end of the line comment, returning whether a newline terminator was consumed
-// and the byte index just after the comment (the newline itself stays
-// unconsumed).
-func scanSQLLineCommentEnd(statement string, start int) (bool, int) {
+// end of the line comment. MySQL only treats "--" as a comment when followed
+// by whitespace or EOF — otherwise "--'" is two unary minus operators and a
+// string literal — so a non-whitespace byte here fails closed. A bare '\r'
+// (not part of a CRLF pair) terminates the comment in PostgreSQL but not in
+// SQLite/MySQL, so it likewise fails closed. Returns whether a newline
+// terminator was consumed (the newline is consumed here and re-emitted by
+// the caller), the byte index just after the comment, and whether scanning
+// is safe.
+func scanSQLLineCommentEnd(statement string, start int) (bool, int, bool) {
+	if start < len(statement) && !isSQLSpace(statement[start]) {
+		return false, 0, false
+	}
 	i := start
 	for i < len(statement) && statement[i] != '\n' {
+		if statement[i] == '\r' && (i+1 >= len(statement) || statement[i+1] != '\n') {
+			return false, 0, false
+		}
 		i++
 	}
 	if i < len(statement) {
-		return true, i + 1
+		return true, i + 1, true
 	}
-	return false, i
+	return false, i, true
 }
 
-// scanSQLDollarConstruct handles PostgreSQL positional parameters ($1, ...) and
-// dollar-quoted literals starting at start. Positional parameters are not
-// literals and pass through as the bare '$'; dollar quotes are redacted. Any
-// unrecognized or unterminated construct is fail closed.
+func isSQLSpace(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\v' || ch == '\f'
+}
+
+// scanSQLDollarConstruct handles PostgreSQL positional parameters ($1, ...)
+// starting at start. Dollar-quoted literals ($$...$$, $tag$...$tag$) invert
+// lexical meaning across dialects — '$' is also a plain identifier byte or a
+// Tcl-style bind parameter opener in SQLite and MySQL — so every
+// non-positional dollar construct fails closed rather than guessing.
+// Positional parameters pass through as the bare '$' after the Tcl-variable
+// parenthesis check.
 func scanSQLDollarConstruct(statement string, start int) (string, int, bool) {
 	if start+1 < len(statement) && statement[start+1] >= '0' && statement[start+1] <= '9' {
+		if hasUnsafeSQLiteVarParen(statement, start) {
+			return "", 0, false
+		}
 		return "$", start + 1, true
 	}
-	tagLen, ok := scanDollarQuoteTag(statement, start)
-	if !ok {
-		return "", 0, false
+	return "", 0, false
+}
+
+// hasUnsafeSQLiteVarParen reports whether a Tcl-style SQLite bind parameter
+// starting at start (a ':', '@', or positional '$' prefix) is followed by a
+// parenthesized suffix whose interior cannot be scanned safely across
+// dialects. SQLite folds :x(...), @x(...) and $1(...) into a single variable
+// token, so an apostrophe inside the parentheses is not a string opener
+// there but is one elsewhere — any ambiguous byte inside the parentheses
+// must fail closed. The scan region ends at the first ')', whitespace byte,
+// or EOF; only EOF without a closing ')' counts as unterminated. Type casts
+// such as $1::varchar(32) are skipped past the parentheses and remain
+// visible.
+func hasUnsafeSQLiteVarParen(statement string, start int) bool {
+	i := start + 1
+	n := 0
+	for i < len(statement) {
+		if isSQLiteIdChar(statement[i]) {
+			n++
+			i++
+			continue
+		}
+		if statement[i] == ':' && i+1 < len(statement) && statement[i+1] == ':' {
+			i += 2
+			continue
+		}
+		break
 	}
-	tag := statement[start : start+tagLen]
-	end := strings.Index(statement[start+tagLen:], tag)
-	if end < 0 {
-		return "", 0, false
+	if n == 0 || i >= len(statement) || statement[i] != '(' {
+		return false
 	}
-	return tag + "[REDACTED]" + tag, start + tagLen + end + tagLen, true
+	for j := i + 1; j < len(statement); j++ {
+		switch statement[j] {
+		case ')':
+			return false
+		case '\'', '"', '`', '\\', '#', '$', '[':
+			return true
+		case '-':
+			if j+1 < len(statement) && statement[j+1] == '-' {
+				return true
+			}
+		case '/':
+			if j+1 < len(statement) && statement[j+1] == '*' {
+				return true
+			}
+		default:
+			if isSQLSpace(statement[j]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isSQLiteIdChar(ch byte) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '$' || ch >= 0x80
 }
 
 // scanSQLBacktickIdentifier scans a MySQL/SQLite backtick-quoted identifier
-// starting at start. Doubled backticks are escapes inside the identifier, and
-// the content is never string material, so quotes inside cannot flip outer
-// parity. An unterminated identifier is fail closed.
+// starting at start. Doubled backticks are escapes inside the identifier. In
+// PostgreSQL a backtick is an operator character rather than an identifier
+// delimiter, so when the interior carries a quote, backslash, comment
+// opener, or other ambiguous byte the scanner cannot tell identifier from
+// operator text across dialects and must fail closed. An unterminated
+// identifier is likewise fail closed.
 func scanSQLBacktickIdentifier(statement string, start int) (int, bool) {
 	for i := start + 1; i < len(statement); i++ {
-		if statement[i] == '`' {
+		switch statement[i] {
+		case '`':
 			if i+1 < len(statement) && statement[i+1] == '`' {
 				i++
 				continue
 			}
 			return i + 1, true
+		case '\'', '"', '\\', '#', '$', '[':
+			return 0, false
+		case '-':
+			if i+1 < len(statement) && statement[i+1] == '-' {
+				return 0, false
+			}
+		case '/':
+			if i+1 < len(statement) && statement[i+1] == '*' {
+				return 0, false
+			}
 		}
 	}
 	return 0, false
@@ -475,7 +573,7 @@ func scanSQLBracketIdentifier(statement string, start int) (int, bool) {
 		switch statement[i] {
 		case ']':
 			return i + 1, true
-		case '\'', '"', '\\', '#', '$':
+		case '\'', '"', '`', '\\', '#', '$':
 			return 0, false
 		case '-':
 			if i+1 < len(statement) && statement[i+1] == '-' {
@@ -490,15 +588,25 @@ func scanSQLBracketIdentifier(statement string, start int) (int, bool) {
 	return 0, false
 }
 
-// scanSQLHexLiteralEnd reports the byte index just after a MySQL unquoted
-// hexadecimal literal (0x or 0X followed by one or more hex digits) starting
-// at start, or 0 when the bytes at start do not form one. The caller passes
+// scanSQLBinaryOrHexLiteralEnd reports the byte index just after a MySQL
+// unquoted binary (0b/0B followed by one or more binary digits) or
+// hexadecimal (0x/0X followed by one or more hex digits) literal starting at
+// start, or 0 when the bytes at start do not form one. The caller passes the
 // index of the leading '0' byte.
-func scanSQLHexLiteralEnd(statement string, start int) int {
+func scanSQLBinaryOrHexLiteralEnd(statement string, start int) int {
 	if start+2 >= len(statement) {
 		return 0
 	}
-	if statement[start] != '0' || (statement[start+1] != 'x' && statement[start+1] != 'X') {
+	if statement[start] != '0' {
+		return 0
+	}
+	var validDigit func(byte) bool
+	switch statement[start+1] {
+	case 'x', 'X':
+		validDigit = isHexDigit
+	case 'b', 'B':
+		validDigit = isBinaryDigit
+	default:
 		return 0
 	}
 	// Require a non-identifier byte before the literal so identifiers like
@@ -510,7 +618,7 @@ func scanSQLHexLiteralEnd(statement string, start int) int {
 		}
 	}
 	end := start + 2
-	for end < len(statement) && isHexDigit(statement[end]) {
+	for end < len(statement) && validDigit(statement[end]) {
 		end++
 	}
 	if end == start+2 {
@@ -523,23 +631,26 @@ func isHexDigit(ch byte) bool {
 	return ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f' || ch >= 'A' && ch <= 'F'
 }
 
+func isBinaryDigit(ch byte) bool {
+	return ch == '0' || ch == '1'
+}
+
 // scanSQLBlockComment returns the byte index just after a block comment.
-// Nested openings are honored because PostgreSQL permits nested block comments;
-// treating them as ambiguous text would reopen the quote-parity attack.
+// PostgreSQL nests block comments while SQLite and MySQL close at the first
+// closing delimiter, and MySQL executes the interior of /*! ... */
+// conditional comments and honors /*+ ... */ optimizer hints — a
+// dialect-agnostic scanner cannot tell comment text from executable SQL
+// across these dialects, so any nested or executable opening fails closed.
 func scanSQLBlockComment(statement string, start int) (int, bool) {
-	depth := 1
+	if start+2 < len(statement) && (statement[start+2] == '!' || statement[start+2] == '+') {
+		return 0, false
+	}
 	for i := start + 2; i < len(statement); i++ {
 		if i+1 < len(statement) && statement[i] == '/' && statement[i+1] == '*' {
-			depth++
-			i++
-			continue
+			return 0, false
 		}
 		if i+1 < len(statement) && statement[i] == '*' && statement[i+1] == '/' {
-			depth--
-			i++
-			if depth == 0 {
-				return i + 1, true
-			}
+			return i + 2, true
 		}
 	}
 	return 0, false
@@ -582,27 +693,6 @@ func scanSQLQuotedLiteral(statement string, start int, quote byte) (int, bool) {
 				continue
 			}
 			return i + 1, true
-		}
-	}
-	return 0, false
-}
-
-// scanDollarQuoteTag recognizes PostgreSQL $tag$ openings. The tag may be
-// empty or contain letters, digits, and underscores, but may not start with a
-// digit or contain a dollar sign.
-func scanDollarQuoteTag(statement string, start int) (int, bool) {
-	if start >= len(statement) || statement[start] != '$' {
-		return 0, false
-	}
-	for i := start + 1; i < len(statement); i++ {
-		ch := statement[i]
-		if ch == '$' {
-			return i - start + 1, true
-		}
-		letter := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
-		digit := ch >= '0' && ch <= '9'
-		if !(letter || digit || ch == '_') || (digit && i == start+1) {
-			return 0, false
 		}
 	}
 	return 0, false

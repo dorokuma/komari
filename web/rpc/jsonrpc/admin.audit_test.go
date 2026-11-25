@@ -254,10 +254,28 @@ func TestRedactSQLStringLiteralsFailClosed(t *testing.T) {
 			forbidden: []string{"super-secret-token", "UPDATE"},
 		},
 		{
-			name:      "backtick identifier apostrophe stays inside identifier",
+			// A backtick carrying quote-like content is a PostgreSQL operator,
+			// not an identifier delimiter, so it must fail closed globally.
+			name:      "backtick identifier apostrophe is fail closed",
 			sql:       "UPDATE t SET `don't`=1, token='super-secret-token', `can't`=2",
-			want:      "UPDATE t SET `don't`=1, token='[REDACTED]', `can't`=2",
-			forbidden: []string{"super-secret-token"},
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name: "plain backtick identifiers pass through",
+			sql:  "UPDATE `clients` SET token='t1'",
+			want: "UPDATE `clients` SET token='[REDACTED]'",
+		},
+		{
+			name: "doubled backtick escape passes through",
+			sql:  "UPDATE `a``b` SET token='t1'",
+			want: "UPDATE `a``b` SET token='[REDACTED]'",
+		},
+		{
+			name:      "postgres backtick operator parity inversion is fail closed",
+			sql:       "UPDATE t SET x = y ` '`', token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
 		},
 		{
 			name:      "bracket identifier containing quote is fail closed",
@@ -267,7 +285,7 @@ func TestRedactSQLStringLiteralsFailClosed(t *testing.T) {
 		},
 		{
 			name:      "mysql hex literal is redacted",
-			sql:       "UPDATE t SET token=0x736563726574 WHERE id=1",
+			sql:       "UPDATE t SET token=0x73757065722d7365637265742d746f6b656e WHERE id=1",
 			want:      "UPDATE t SET token=0x[REDACTED] WHERE id=1",
 			forbidden: []string{"736563726574"},
 		},
@@ -282,6 +300,131 @@ func TestRedactSQLStringLiteralsFailClosed(t *testing.T) {
 			sql:       `UPDATE t SET path='C:\Users\admin', token='path-secret'`,
 			want:      "UPDATE t SET path='[REDACTED]', token='[REDACTED]'",
 			forbidden: []string{"path-secret", "C:\\Users"},
+		},
+		{
+			name:      "non-nested block comment parity inversion is fail closed",
+			sql:       "/* /* */ UPDATE clients SET a='*/', token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "mysql executable comment is fail closed",
+			sql:       "/*!50000 UPDATE t SET a='*/', token='super-secret-token' */ -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "mysql optimizer hint comment is fail closed",
+			sql:       "/*+ MAX_EXECUTION_TIME(1000) */ UPDATE t SET token='super-secret-token'",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "dollar identifier suffix parity inversion is fail closed",
+			sql:       "UPDATE t SET a$$='$$', token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "mysql bare dollar identifier is fail closed",
+			sql:       "UPDATE t SET $$='$$', token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "sqlite dollar bind parameter is fail closed",
+			sql:       "UPDATE t SET a=$x$, b='$x$', token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "mysql dashdash without whitespace is fail closed",
+			sql:       "UPDATE t SET x=--'\n', token='super-secret-token', y='--'",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "postgres bare carriage return ends line comment and is fail closed",
+			sql:       "-- hi\rUPDATE t SET a='\n', token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "sqlite tcl variable colon prefix parity inversion is fail closed",
+			sql:       "UPDATE clients SET a=:x('), token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "sqlite tcl variable at prefix is fail closed",
+			sql:       "UPDATE clients SET a=@x('), token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "sqlite tcl variable dollar positional is fail closed",
+			sql:       "UPDATE clients SET a=$1('), token='super-secret-token' -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			// An unterminated Tcl-variable parenthesis swallows the rest of the
+			// statement in SQLite but nothing elsewhere, so it fails closed even
+			// when the interior carries no ambiguous byte.
+			name:      "sqlite tcl variable unterminated paren is fail closed",
+			sql:       "UPDATE clients SET a=:x(v1,token='super-secret-token'",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "postgres dollar quote parity inversion is fail closed",
+			sql:       "UPDATE t SET a=$tag$'$$'$tag$, token='super-secret-token'",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name: "crlf line comment passes through",
+			sql:  "-- comment\r\nUPDATE t SET token='t1'",
+			want: "--[REDACTED]\nUPDATE t SET token='[REDACTED]'",
+		},
+		{
+			name: "dashdash eof comment passes through",
+			sql:  "UPDATE t SET token='t1' -- tail",
+			want: "UPDATE t SET token='[REDACTED]' --[REDACTED]",
+		},
+		{
+			name:      "postgres cast with width passes through",
+			sql:       "UPDATE clients SET token=$1::varchar(32) WHERE uuid=$2",
+			want:      "UPDATE clients SET token=$1::varchar(32) WHERE uuid=$2",
+			forbidden: []string{"[REDACTED]"},
+		},
+		{
+			name:      "postgres cast with precision passes through",
+			sql:       "UPDATE clients SET token=$1::numeric(10, 2) WHERE uuid=$2",
+			want:      "UPDATE clients SET token=$1::numeric(10, 2) WHERE uuid=$2",
+			forbidden: []string{"[REDACTED]"},
+		},
+		{
+			name: "sqlite tcl variable with clean paren passes through",
+			sql:  "UPDATE clients SET token=:x(32)",
+			want: "UPDATE clients SET token=:x(32)",
+		},
+		{
+			name:      "mysql binary literal is redacted",
+			sql:       "UPDATE t SET token=0b011010110110010101111001 WHERE id=1",
+			want:      "UPDATE t SET token=0b[REDACTED] WHERE id=1",
+			forbidden: []string{"01101011"},
+		},
+		{
+			name: "binary digit sequence not literal passes through",
+			sql:  "UPDATE t SET token='x' WHERE b0b11=1",
+			want: "UPDATE t SET token='[REDACTED]' WHERE b0b11=1",
+		},
+		{
+			name:      "bracket identifier containing backtick is fail closed",
+			sql:       "UPDATE t SET [a`b]=1, token='super-secret-token'",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
 		},
 	}
 	for _, tc := range cases {
