@@ -68,13 +68,18 @@ func TestSuspendedSessionDoesNotExtendCleanupOnAgentChurn(t *testing.T) {
 		t.Fatalf("agent1 frame = %q, want %q", frame.Type, controlTypeAbort)
 	}
 
-	// Simulate reverse-proxy idle drops + agent reconnects every 35ms. Before
-	// the fix, every suspendAgent and attachAgent reset CleanupTimer to a fresh
-	// 120ms, keeping the session alive indefinitely.
-	latestAgentSafe := agent1Safe
+	// Simulate reverse-proxy idle drops + agent reconnects roughly every 30ms.
+	// Churn continues across the full original 120ms window: before the fix,
+	// every suspendAgent/attachAgent reset CleanupTimer to a fresh 120ms, so the
+	// session outlived its original deadline indefinitely; with the fixed
+	// deadline the session must be gone right around the first deadline even
+	// though reconnect churn never stopped.
+	churnStarted := time.Now()
 	latestAgentClient := agent1Client
-	for i := 0; i < 3; i++ {
-		time.Sleep(30 * time.Millisecond)
+	latestAgentSafe := agent1Safe
+	churnedPastDeadline := false
+	for time.Since(churnStarted) < 150*time.Millisecond {
+		time.Sleep(25 * time.Millisecond)
 		suspendAgent("session-agent-churn", latestAgentSafe)
 
 		nextSafe, nextClient := newControlPair(t)
@@ -85,6 +90,12 @@ func TestSuspendedSessionDoesNotExtendCleanupOnAgentChurn(t *testing.T) {
 		}
 		latestAgentSafe = nextSafe
 		latestAgentClient = nextClient
+		if time.Since(churnStarted) > 120*time.Millisecond {
+			churnedPastDeadline = true
+		}
+	}
+	if churnedPastDeadline {
+		t.Fatal("session survived past its original fixed retention deadline while churn never stopped — cleanup deadline was extended")
 	}
 
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -134,8 +145,10 @@ func TestSuspendedSessionDoesNotExtendCleanupOnBrowserChurn(t *testing.T) {
 	}
 
 	currentBrowser := browser1Safe
-	for i := 0; i < 3; i++ {
-		time.Sleep(30 * time.Millisecond)
+	churnStarted := time.Now()
+	churnedPastDeadline := false
+	for time.Since(churnStarted) < 150*time.Millisecond {
+		time.Sleep(25 * time.Millisecond)
 		suspendBrowser("session-browser-churn", currentBrowser)
 
 		nextSafe, nextClient := newControlPair(t)
@@ -144,6 +157,12 @@ func TestSuspendedSessionDoesNotExtendCleanupOnBrowserChurn(t *testing.T) {
 			break
 		}
 		currentBrowser = nextSafe
+		if time.Since(churnStarted) > 120*time.Millisecond {
+			churnedPastDeadline = true
+		}
+	}
+	if churnedPastDeadline {
+		t.Fatal("session survived past its original fixed retention deadline while churn never stopped — cleanup deadline was extended")
 	}
 
 	deadline := time.Now().Add(500 * time.Millisecond)

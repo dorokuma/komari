@@ -273,6 +273,26 @@ func TestManagerObserveUsesUptimeForRebootAndJitter(t *testing.T) {
 	}
 }
 
+func TestManagerObserveMonotonicCounterAcrossAgentRestart(t *testing.T) {
+	manager, _ := newTestManager(t)
+	ctx := context.Background()
+	const oneGiB = int64(1 << 30)
+	at := time.Now().UTC()
+	if err := manager.UpdateConfig(ctx, "node-1", UpdateConfigRequest{CycleConfig: monthlyConfig()}, reportPtr("node-1", at, 200*oneGiB, 150*oneGiB, 864000)); err != nil {
+		t.Fatal(err)
+	}
+	// Agent restarts (uptime collapses) but persists its cumulative counter and
+	// resumes adding on top of it: only the true delta may be counted, never the
+	// full historical counter.
+	if err := manager.ObserveReport(reportAt("node-1", at.Add(time.Minute), 200*oneGiB+5<<20, 150*oneGiB+3<<20, 15)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := manager.Get("node-1")
+	if got.AccumulatedUp != 5<<20 || got.AccumulatedDown != 3<<20 {
+		t.Fatalf("cross-restart monotonic delta = %d/%d, want 5MiB/3MiB", got.AccumulatedUp, got.AccumulatedDown)
+	}
+}
+
 func TestFlushDirtyRollsOfflineCyclesAndClearsBaseline(t *testing.T) {
 	manager, db := newTestManager(t)
 	ctx := context.Background()
@@ -467,6 +487,68 @@ func TestFailedFlushRetainsDirtyStateAndCycleClose(t *testing.T) {
 	}
 	if entry.dirty || len(manager.closures) != 0 {
 		t.Fatal("successful retry did not clear dirty state")
+	}
+}
+
+// TestShutdownPersistsFinalObservations is the regression guard for the
+// flush-then-stop race: samples accepted before Shutdown must be persisted by
+// the final flush, and samples arriving after Shutdown must be rejected
+// instead of silently dropped.
+func TestShutdownPersistsFinalObservations(t *testing.T) {
+	manager, db := newTestManager(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := manager.UpdateConfig(ctx, "node-1", UpdateConfigRequest{CycleConfig: monthlyConfig()}, reportPtr("node-1", now, 100, 200, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	// Observe a sample but never flush: only Shutdown's final flush may persist it.
+	if err := manager.ObserveReport(reportAt("node-1", now.Add(time.Minute), 160, 260, 1060)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	var persisted models.ClientTrafficLedger
+	if err := db.First(&persisted, "uuid = ?", "node-1").Error; err != nil {
+		t.Fatalf("load persisted ledger after shutdown: %v", err)
+	}
+	if persisted.AccumulatedUp != 60 || persisted.AccumulatedDown != 60 {
+		t.Fatalf("final flush persisted %d/%d, want 60/60", persisted.AccumulatedUp, persisted.AccumulatedDown)
+	}
+	// Post-shutdown observations are rejected rather than silently lost.
+	if err := manager.ObserveReport(reportAt("node-1", now.Add(2*time.Minute), 999, 999, 1120)); !errors.Is(err, ErrManagerStopped) {
+		t.Fatalf("post-shutdown observe error = %v, want ErrManagerStopped", err)
+	}
+	if err := manager.Shutdown(ctx); err != nil {
+		t.Fatalf("second shutdown = %v, want nil", err)
+	}
+}
+
+// TestSetDefaultTimezoneBackwardShiftPreservesUsage guards the reverse
+// direction of timezone inheritance refresh: moving the inherited timezone
+// backwards (Asia/Tokyo -> UTC) shifts the cycle start later in absolute time
+// while still describing the same accounting cycle, so accumulated usage must
+// survive instead of being wiped by a false rollover.
+func TestSetDefaultTimezoneBackwardShiftPreservesUsage(t *testing.T) {
+	manager, _ := newTestManager(t)
+	if err := manager.SetDefaultTimezone("Asia/Tokyo"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := CycleConfig{Mode: ModeMonthly, ResetDay: 1, IntervalDays: 30}
+	if err := manager.UpdateConfig(context.Background(), "node-1", UpdateConfigRequest{CycleConfig: cfg}, reportPtr("node-1", time.Now().UTC(), 100, 200, 500)); err != nil {
+		t.Fatal(err)
+	}
+	entry := manager.entries["node-1"]
+	entry.row.AccumulatedUp, entry.row.AccumulatedDown, entry.row.OffsetUp = 440, 550, 9
+	if err := manager.SetDefaultTimezone("UTC"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := manager.Get("node-1")
+	if got.AccumulatedUp != 440 || got.AccumulatedDown != 550 || got.OffsetUp != 9 {
+		t.Fatalf("backward timezone shift wiped usage: %+v", got)
+	}
+	if len(manager.closures) != 0 {
+		t.Fatalf("backward timezone shift produced %d spurious closures", len(manager.closures))
 	}
 }
 

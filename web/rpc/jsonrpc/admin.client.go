@@ -12,7 +12,9 @@ import (
 	"github.com/komari-monitor/komari/internal/metricstore"
 	"github.com/komari-monitor/komari/internal/trafficledger"
 	"github.com/komari-monitor/komari/pkg/rpc"
+	"github.com/komari-monitor/komari/utils/notifier"
 	agent_runtime "github.com/komari-monitor/komari/web/agent"
+	"github.com/komari-monitor/komari/web/api/terminal"
 )
 
 // admin.client.go
@@ -200,12 +202,18 @@ func adminRemoveClient(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.
 		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid or missing UUID", nil)
 	}
 	existing, existingErr := clients.GetClientByUUID(params.UUID)
-	if err := trafficledger.DeleteClient(params.UUID); err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, "Failed to delete client traffic ledger: "+err.Error(), nil)
-	}
+	// Delete the client row first: only after that succeeds is the traffic
+	// ledger removed, so a failed deletion never loses the ledger's
+	// calibration offsets while UpdateConfig still re-verifies client
+	// existence inside its own transaction.
 	if err := clients.DeleteClient(params.UUID); err != nil {
 		return nil, rpc.MakeError(rpc.InternalError, "Failed to delete client"+err.Error(), nil)
 	}
+	if err := trafficledger.DeleteClient(params.UUID); err != nil {
+		return nil, rpc.MakeError(rpc.InternalError, "Failed to delete client traffic ledger: "+err.Error(), nil)
+	}
+	terminal.CloseSessionsByClientUUID(params.UUID)
+	notifier.ResetTrafficAlertState(params.UUID)
 	metricstore.DeleteEntityAsync(params.UUID)
 	actor, ip := auditActor(ctx)
 	clientLabel := params.UUID

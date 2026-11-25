@@ -225,7 +225,9 @@ func suspendSide(id string, conn *connection.SafeConn, matchBrowser bool) {
 
 	_ = conn.Close()
 	// 持锁期间不写 socket：写入可能阻塞，会拖住整个会话表。
-	if survivor != nil {
+	// abort 发往 survivor 前重新核对会话身份：若在持锁之外对端已经重连
+	// （重挂 abort），旧连接断开的通知不得覆盖新世代的恢复状态。
+	if survivor != nil && isSessionSurvivor(id, session, survivor, matchBrowser) {
 		notifyAbort(survivor)
 	}
 	// 浏览器仍在线而被控端掉线时，主动重发终端请求唤醒被控端（兼容不自动重连的旧版 Agent）。
@@ -234,17 +236,45 @@ func suspendSide(id string, conn *connection.SafeConn, matchBrowser bool) {
 	}
 }
 
+// isSessionSurvivor reports whether survivor is still the live peer of the
+// same session generation: the browser side checks the agent slot and vice
+// versa. A stale suspend that lost the race with a reattach must not abort
+// the freshly reconnected peer.
+func isSessionSurvivor(id string, session *TerminalSession, survivor *connection.SafeConn, browserDetached bool) bool {
+	TerminalSessionsMutex.Lock()
+	defer TerminalSessionsMutex.Unlock()
+	current := TerminalSessions[id]
+	if current == nil || current != session {
+		return false
+	}
+	if browserDetached {
+		return current.Agent == survivor
+	}
+	return current.Browser == survivor
+}
+
 func suspendBrowser(id string, conn *connection.SafeConn) { suspendSide(id, conn, true) }
 func suspendAgent(id string, conn *connection.SafeConn)   { suspendSide(id, conn, false) }
 
 // closeSession 结束会话：给两端发 terminate 并清理。terminate 是终态，
 // 收到的一方不会再重连，所以这里可以直接关闭连接。
 func closeSession(id string) {
+	closeSessionIfCurrent(id, nil)
+}
+
+// closeSessionIfCurrent 与 closeSession 相同，但当 conn 非空时要求发起方仍是
+// 会话当前附着的连接：同 client_id 重连替换旧连接后，旧连接读循环随后发出的
+// terminate 不得误杀新世代已恢复的会话。
+func closeSessionIfCurrent(id string, conn *connection.SafeConn) {
 	var browser, agent *connection.SafeConn
 	var closedSession *TerminalSession
 
 	TerminalSessionsMutex.Lock()
 	if session, ok := TerminalSessions[id]; ok && session != nil {
+		if conn != nil && session.Browser != conn && session.Agent != conn {
+			TerminalSessionsMutex.Unlock()
+			return
+		}
 		stopCleanup(session)
 		if session.auditEndReason == "" {
 			session.auditEndReason = "closed"
@@ -272,7 +302,7 @@ func closeSession(id string) {
 }
 
 func canAttachBrowserLocked(session *TerminalSession, clientUUID, userUUID string, apiKey bool, clientID string) (allowed bool, alreadyAttached bool) {
-	if session == nil || session.UUID != clientUUID || (!apiKey && session.UserUUID != userUUID) {
+	if session == nil || session.UUID != clientUUID || (!apiKey && (userUUID == "" || session.UserUUID != userUUID)) {
 		return false, false
 	}
 	if session.Browser != nil && (clientID == "" || session.BrowserClientID != clientID) {

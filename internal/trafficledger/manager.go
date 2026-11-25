@@ -250,6 +250,69 @@ func (m *Manager) Get(uuid string) (LedgerSnapshot, bool) {
 	return snapshotFromModel(entry.row), true
 }
 
+// flushSnapshots are the dirty rows versionsed under m.mu so a failed flush
+// can merge concurrent increments back into the in-memory entries.
+type flushSnapshot struct {
+	rows     []models.ClientTrafficLedger
+	versions map[string]uint64
+	closures []ClosedCycleSnapshot
+	hook     CycleCloseHook
+}
+
+// snapshotDirtyLocked rolls offline cycles and captures all dirty rows and
+// pending closures. Call with m.mu held.
+func (m *Manager) snapshotDirtyLocked(now time.Time) flushSnapshot {
+	for _, entry := range m.entries {
+		if isAutomaticMode(entry.row.Mode) && needsRollover(entry.row, now) {
+			_ = m.refreshAutomaticCycleLocked(entry, now)
+		}
+	}
+	snap := flushSnapshot{
+		rows:     make([]models.ClientTrafficLedger, 0),
+		versions: make(map[string]uint64),
+		hook:     m.hook,
+	}
+	for uuid, entry := range m.entries {
+		if entry.dirty {
+			snap.rows = append(snap.rows, cloneLedger(entry.row))
+			snap.versions[uuid] = entry.version
+		}
+	}
+	closures, _ := m.snapshotClosuresLocked(nil)
+	snap.closures = closures
+	return snap
+}
+
+// commitFlushSnapshot persists rows and closures without holding m.mu; the
+// database transaction must never run inside the global lock because SQLite
+// single-connection waits would otherwise freeze every ObserveReport.
+func (m *Manager) commitFlushSnapshot(ctx context.Context, snap flushSnapshot) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := upsertLedgers(tx, snap.rows); err != nil {
+			return fmt.Errorf("persist traffic ledgers: %w", err)
+		}
+		if len(snap.closures) > 0 && snap.hook != nil {
+			if err := snap.hook(tx, snap.closures); err != nil {
+				return fmt.Errorf("close traffic cycles: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+// settleFlushLocked clears dirty flags for exactly the versions that were
+// persisted. Rows observed or calibrated while the transaction ran carry a
+// newer version and keep their dirty flag, so concurrent increments are never
+// dropped; the closures list only drops entries covered by this flush.
+func (m *Manager) settleFlushLocked(snap flushSnapshot, maxSeq uint64) {
+	for uuid, version := range snap.versions {
+		if entry := m.entries[uuid]; entry != nil && entry.version == version {
+			entry.dirty = false
+		}
+	}
+	m.trimClosuresLocked(maxSeq)
+}
+
 // FlushDirty checks for offline cycle rollovers and commits all dirty ledgers
 // and queued cycle closures in a single database transaction.
 func (m *Manager) FlushDirty(ctx context.Context) error {
@@ -268,67 +331,56 @@ func (m *Manager) FlushDirty(ctx context.Context) error {
 		m.mu.Unlock()
 		return ErrManagerStopped
 	}
-	now := time.Now().UTC()
-	for _, entry := range m.entries {
-		if isAutomaticMode(entry.row.Mode) && needsRollover(entry.row, now) {
-			_ = m.refreshAutomaticCycleLocked(entry, now)
-		}
-	}
-	rows := make([]models.ClientTrafficLedger, 0)
-	versions := make(map[string]uint64)
-	for uuid, entry := range m.entries {
-		if entry.dirty {
-			rows = append(rows, cloneLedger(entry.row))
-			versions[uuid] = entry.version
-		}
-	}
-	closures, maxSeq := m.snapshotClosuresLocked(nil)
-	hook := m.hook
+	snap := m.snapshotDirtyLocked(time.Now().UTC())
+	_, maxSeq := m.snapshotClosuresLocked(nil)
 	m.mu.Unlock()
 
-	if len(rows) == 0 && len(closures) == 0 {
+	if len(snap.rows) == 0 && len(snap.closures) == 0 {
 		return nil
 	}
-	if err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := upsertLedgers(tx, rows); err != nil {
-			return fmt.Errorf("persist traffic ledgers: %w", err)
-		}
-		if len(closures) > 0 && hook != nil {
-			if err := hook(tx, closures); err != nil {
-				return fmt.Errorf("close traffic cycles: %w", err)
-			}
-		}
-		return nil
-	}); err != nil {
+	if err := m.commitFlushSnapshot(ctx, snap); err != nil {
 		return err
 	}
 
 	m.mu.Lock()
-	for uuid, version := range versions {
-		if entry := m.entries[uuid]; entry != nil && entry.version == version {
-			entry.dirty = false
-		}
-	}
-	m.trimClosuresLocked(maxSeq)
+	m.settleFlushLocked(snap, maxSeq)
 	m.mu.Unlock()
 	return nil
 }
 
+// Shutdown stops accepting new samples first, then performs the final flush.
+// Marking stopped inside m.mu before the last transaction closes the race in
+// which a report observed between the final flush and the old stopping point
+// would be silently dropped without ever reaching the database.
 func (m *Manager) Shutdown(ctx context.Context) error {
-	m.mu.RLock()
-	stopped, initialized := m.stopped, m.initialized
-	m.mu.RUnlock()
-	if stopped {
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
 		return nil
 	}
-	if !initialized {
+	if !m.initialized {
+		m.mu.Unlock()
 		return ErrManagerNotInitialized
 	}
-	if err := m.FlushDirty(ctx); err != nil {
+	// Stop accepting new observations before snapshotting so every accepted
+	// sample is either already in the snapshot or rejected from here on.
+	m.stopped = true
+	snap := m.snapshotDirtyLocked(time.Now().UTC())
+	_, maxSeq := m.snapshotClosuresLocked(nil)
+	m.mu.Unlock()
+
+	if len(snap.rows) == 0 && len(snap.closures) == 0 {
+		return nil
+	}
+	if err := m.commitFlushSnapshot(ctx, snap); err != nil {
 		return err
 	}
+
 	m.mu.Lock()
-	m.stopped = true
+	m.settleFlushLocked(snap, maxSeq)
 	m.mu.Unlock()
 	return nil
 }
@@ -377,57 +429,97 @@ func (m *Manager) UpdateConfig(ctx context.Context, uuid string, req UpdateConfi
 	oldMode := row.Mode
 
 	if !sameCycleConfig(configFromModel(row), req.CycleConfig) {
-		row.Mode = req.Mode
-		row.ResetDay = req.ResetDay
-		row.IntervalDays = req.IntervalDays
-		row.AnchorAt = cloneTime(req.AnchorAt)
-		row.Timezone = req.Timezone
-
-		switch {
-		case req.Mode == ModeAgent:
-			if oldMode != ModeAgent && row.CycleStartAt != nil {
-				extraCloses = append(extraCloses, closeSnapshot(row, now, CloseReasonModeChanged))
-			}
-			clearCycleCounters(&row)
-			clearBaseline(&row)
-			row.CycleStartAt, row.CycleEndAt = nil, nil
-
-		case oldMode == ModeAgent:
-			// Fresh opt-in to server-side accounting.
-			clearCycleCounters(&row)
-			if err := m.assignCycleWindowLocked(&row, now); err != nil {
-				return err
-			}
-			seedBaseline(&row, latestRaw, now)
-			if req.PreserveCurrentUsage && latestRaw != nil {
-				up := max(latestRaw.Network.TotalUp, 0)
-				down := max(latestRaw.Network.TotalDown, 0)
-				if up > 0 || down > 0 {
-					row.OffsetUp = up
-					row.OffsetDown = down
-					row.CalibratedAt = timePointer(now)
-				}
-			}
-
-		default:
-			// Stay in server mode: preserve accumulated usage and offsets,
-			// update cycle boundaries, and seed baseline if still missing.
-			if err := m.assignCycleWindowLocked(&row, now); err != nil {
-				return err
-			}
-			if !row.HasBaseline {
-				seedBaseline(&row, latestRaw, now)
-			}
+		closes, err := m.applyModeTransitionLocked(&row, oldMode, req, latestRaw, now)
+		if err != nil {
+			return err
 		}
+		extraCloses = append(extraCloses, closes...)
 	}
 	row.UpdatedAt = now
 
 	closures, maxSeq := m.snapshotClosuresLocked(extraCloses)
-	if err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if req.TrafficLimit != nil || trafficLimitType != nil {
+	if err := m.commitConfigTransaction(ctx, uuid, row, req.TrafficLimit, trafficLimitType, closures); err != nil {
+		return fmt.Errorf("update traffic ledger config: %w", err)
+	}
+
+	if entry == nil {
+		entry = &ledgerEntry{}
+		m.entries[uuid] = entry
+	}
+	entry.row = row
+	entry.dirty = false
+	entry.version++
+	m.trimClosuresLocked(maxSeq)
+	return nil
+}
+
+// applyModeTransitionLocked rewrites row in place for a cycle config change,
+// returning any cycle close snapshot caused by leaving server-side accounting.
+func (m *Manager) applyModeTransitionLocked(row *models.ClientTrafficLedger, oldMode string, req UpdateConfigRequest, latestRaw *v2.Report, now time.Time) ([]ClosedCycleSnapshot, error) {
+	row.Mode = req.Mode
+	row.ResetDay = req.ResetDay
+	row.IntervalDays = req.IntervalDays
+	row.AnchorAt = cloneTime(req.AnchorAt)
+	row.Timezone = req.Timezone
+
+	switch {
+	case req.Mode == ModeAgent:
+		var closes []ClosedCycleSnapshot
+		if oldMode != ModeAgent && row.CycleStartAt != nil {
+			closes = append(closes, closeSnapshot(*row, now, CloseReasonModeChanged))
+		}
+		clearCycleCounters(row)
+		clearBaseline(row)
+		row.CycleStartAt, row.CycleEndAt = nil, nil
+		return closes, nil
+
+	case oldMode == ModeAgent:
+		// Fresh opt-in to server-side accounting.
+		clearCycleCounters(row)
+		if err := m.assignCycleWindowLocked(row, now); err != nil {
+			return nil, err
+		}
+		seedBaseline(row, latestRaw, now)
+		if req.PreserveCurrentUsage && latestRaw != nil {
+			up := max(latestRaw.Network.TotalUp, 0)
+			down := max(latestRaw.Network.TotalDown, 0)
+			if up > 0 || down > 0 {
+				row.OffsetUp = up
+				row.OffsetDown = down
+				row.CalibratedAt = timePointer(now)
+			}
+		}
+		return nil, nil
+	}
+
+	// Stay in server mode: preserve accumulated usage and offsets, update
+	// cycle boundaries, and seed baseline if still missing.
+	if err := m.assignCycleWindowLocked(row, now); err != nil {
+		return nil, err
+	}
+	if !row.HasBaseline {
+		seedBaseline(row, latestRaw, now)
+	}
+	return nil, nil
+}
+
+// commitConfigTransaction persists the config update in one transaction. It
+// first re-verifies the client row exists so a concurrent adminRemoveClient
+// cannot race a config update into resurrecting an orphaned ledger for the
+// deleted node.
+func (m *Manager) commitConfigTransaction(ctx context.Context, uuid string, row models.ClientTrafficLedger, trafficLimit *int64, trafficLimitType *string, closures []ClosedCycleSnapshot) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var clientCount int64
+		if err := tx.Model(&models.Client{}).Where("uuid = ?", uuid).Count(&clientCount).Error; err != nil {
+			return err
+		}
+		if clientCount == 0 {
+			return fmt.Errorf("client %s no longer exists", uuid)
+		}
+		if trafficLimit != nil || trafficLimitType != nil {
 			updates := make(map[string]any, 2)
-			if req.TrafficLimit != nil {
-				updates["traffic_limit"] = *req.TrafficLimit
+			if trafficLimit != nil {
+				updates["traffic_limit"] = *trafficLimit
 			}
 			if trafficLimitType != nil {
 				updates["traffic_limit_type"] = *trafficLimitType
@@ -443,19 +535,7 @@ func (m *Manager) UpdateConfig(ctx context.Context, uuid string, req UpdateConfi
 			return m.hook(tx, closures)
 		}
 		return nil
-	}); err != nil {
-		return fmt.Errorf("update traffic ledger config: %w", err)
-	}
-
-	if entry == nil {
-		entry = &ledgerEntry{}
-		m.entries[uuid] = entry
-	}
-	entry.row = row
-	entry.dirty = false
-	entry.version++
-	m.trimClosuresLocked(maxSeq)
-	return nil
+	})
 }
 
 func (m *Manager) Calibrate(ctx context.Context, uuid string, req CalibrateRequest) (CalibrationResult, error) {
@@ -666,6 +746,17 @@ func (m *Manager) refreshAutomaticCycleLocked(entry *ledgerEntry, at time.Time) 
 		return nil
 	}
 	if start.After(row.CycleStartAt.UTC()) {
+		// A boundary shift caused purely by a timezone configuration change
+		// still describes the SAME accounting cycle in absolute time: the old
+		// end has not passed yet, so the accumulated usage must be preserved
+		// and only the boundaries updated in place. A real rollover is only
+		// when the current cycle has actually expired.
+		if row.CycleEndAt != nil && at.Before(row.CycleEndAt.UTC()) {
+			row.CycleStartAt, row.CycleEndAt = cloneTime(start), cloneTime(end)
+			row.UpdatedAt = at.UTC()
+			markDirty(entry)
+			return nil
+		}
 		rebaseline := row.RawLastAt == nil || at.Sub(row.RawLastAt.UTC()) > crossCycleGapLimit
 		m.rolloverEntryLocked(entry, start, end, rebaseline)
 		return nil

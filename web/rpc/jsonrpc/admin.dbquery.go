@@ -121,7 +121,7 @@ func adminDBExec(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRp
 	}
 
 	actor, ip := auditActor(ctx)
-	sqlPreview := "SQL: " + auditlog.Truncate(statement, 2000)
+	sqlPreview := "SQL: " + auditlog.Truncate(redactSQLStringLiterals(statement), 2000)
 	argsNote := ""
 	if len(params.Args) > 0 {
 		argsNote = fmt.Sprintf(", args=%d", len(params.Args))
@@ -333,6 +333,48 @@ func collectDatabaseRows(rows *sql.Rows, limit int) ([]string, [][]any, bool, er
 		return nil, nil, false, err
 	}
 	return columns, resultRows, false, nil
+}
+
+// redactSQLStringLiterals replaces the contents of single-quoted SQL string
+// literals with a placeholder before they reach the audit log. Statements
+// legitimately executed through admin:dbExec can embed credentials verbatim
+// (UPDATE clients SET token='…'), and audit logs are queryable, backed up and
+// retained far beyond the database itself. This is a conservative lexical
+// scan honoring SQL ” escaping — not a parser — so it may redact a quoted
+// sequence inside a comment too, which is the safe direction.
+func redactSQLStringLiterals(statement string) string {
+	var out strings.Builder
+	out.Grow(len(statement))
+	inLiteral := false
+	redacted := false
+	for i := 0; i < len(statement); i++ {
+		ch := statement[i]
+		if !inLiteral {
+			if ch == '\'' {
+				inLiteral = true
+				redacted = false
+				out.WriteByte(ch)
+				continue
+			}
+			out.WriteByte(ch)
+			continue
+		}
+		if ch == '\'' {
+			if i+1 < len(statement) && statement[i+1] == '\'' {
+				// Escaped quote inside the literal: consume both, stay redacted.
+				i++
+				continue
+			}
+			inLiteral = false
+			out.WriteByte(ch)
+			continue
+		}
+		if !redacted {
+			out.WriteString("[REDACTED]")
+			redacted = true
+		}
+	}
+	return out.String()
 }
 
 func normalizeDatabaseValue(value any) any {

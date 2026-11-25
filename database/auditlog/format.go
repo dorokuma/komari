@@ -357,6 +357,14 @@ func FormatValue(key string, value any) string {
 	case string:
 		trimmed := strings.TrimSpace(v)
 		switch {
+		case lowerKey == "body":
+			// Webhook/notification bodies are free-form templates that can embed
+			// tokens or signed payloads required by the target service; only
+			// their length is safe to record.
+			if trimmed == "" {
+				return `""`
+			}
+			return fmt.Sprintf("[BODY, %d chars]", utf8.RuneCountInString(trimmed))
 		case strings.Contains(lowerKey, "dsn"):
 			return strconv.Quote(Truncate(RedactDSN(trimmed), defaultValueMaxRunes))
 		case lowerKey == "url" || strings.HasSuffix(lowerKey, "_url") || strings.HasSuffix(lowerKey, "url"):

@@ -290,6 +290,28 @@ func TestSafeConnNoInterceptorZeroCost(t *testing.T) {
 	}
 }
 
+// TestSafeConnCloseDoesNotWaitForWriteLock 是半开连接自死锁的回归测试：
+// writeFrame 持有 sc.mu 且阻塞在内核写中（这里用直接持锁模拟）时，Close
+// 必须仍能立刻关闭底层 socket 打断阻塞写，而不是等锁把自己拖死。
+func TestSafeConnCloseDoesNotWaitForWriteLock(t *testing.T) {
+	server := wsEchoServer(t)
+	defer server.Close()
+	sc := dialEcho(t, server)
+
+	// 模拟一个卡在半开对端 write(2) 里的 writer：它持着 sc.mu 永不释放。
+	sc.mu.Lock()
+	closed := make(chan error, 1)
+	go func() { closed <- sc.Close() }()
+	select {
+	case <-closed:
+		// Close 立即返回，不等待写锁。
+	case <-time.After(time.Second):
+		sc.mu.Unlock()
+		t.Fatal("Close blocked behind the write mutex — half-open deadlock regression")
+	}
+	sc.mu.Unlock()
+}
+
 // TestSafeConnOnCloseOnce 验证 Close 只触发一次 OnClose。
 func TestSafeConnOnCloseOnce(t *testing.T) {
 	server := wsEchoServer(t)
