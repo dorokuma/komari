@@ -402,9 +402,10 @@ func redactSQLStringLiterals(statement string) string {
 			// MySQL unquoted binary and hexadecimal literals (0b..., 0x...) are
 			// byte-string value carriers and must be redacted like quoted
 			// literals.
+			end := scanSQLBinaryOrHexLiteralEnd(statement, i)
 			out.WriteString(statement[i : i+2])
 			out.WriteString("[REDACTED]")
-			i = scanSQLBinaryOrHexLiteralEnd(statement, i)
+			i = end
 		case ch == '$':
 			written, next, ok := scanSQLDollarConstruct(statement, i)
 			if !ok {
@@ -635,6 +636,27 @@ func isBinaryDigit(ch byte) bool {
 	return ch == '0' || ch == '1'
 }
 
+// isExecutableBlockCommentStart reports whether the bytes just after a "/*"
+// opener at start mark a conditionally executable comment: MySQL /*! ... */
+// conditional comments and /*+ ... */ optimizer hints, MariaDB /*M! ... */
+// (optionally versioned /*M!NNNNNN ... */), and TiDB /*T! ... */. Their
+// interiors execute as normal SQL in the respective dialect, so a string
+// literal inside can carry */ without closing the comment — a
+// dialect-agnostic scanner must fail closed on them. Ordinary comments such
+// as "/* MariaDB note */" or "/* TODO! */" are unaffected because the '!'
+// must sit in the third position immediately after an 'M'/'m'/'T'/'t'.
+func isExecutableBlockCommentStart(statement string, start int) bool {
+	if start+2 >= len(statement) {
+		return false
+	}
+	ch := statement[start+2]
+	if ch == '!' || ch == '+' {
+		return true
+	}
+	return start+3 < len(statement) && statement[start+3] == '!' &&
+		(ch == 'M' || ch == 'm' || ch == 'T' || ch == 't')
+}
+
 // scanSQLBlockComment returns the byte index just after a block comment.
 // PostgreSQL nests block comments while SQLite and MySQL close at the first
 // closing delimiter, and MySQL executes the interior of /*! ... */
@@ -642,7 +664,7 @@ func isBinaryDigit(ch byte) bool {
 // dialect-agnostic scanner cannot tell comment text from executable SQL
 // across these dialects, so any nested or executable opening fails closed.
 func scanSQLBlockComment(statement string, start int) (int, bool) {
-	if start+2 < len(statement) && (statement[start+2] == '!' || statement[start+2] == '+') {
+	if isExecutableBlockCommentStart(statement, start) {
 		return 0, false
 	}
 	for i := start + 2; i < len(statement); i++ {

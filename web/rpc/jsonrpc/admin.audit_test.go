@@ -320,6 +320,28 @@ func TestRedactSQLStringLiteralsFailClosed(t *testing.T) {
 			forbidden: []string{"super-secret-token", "UPDATE"},
 		},
 		{
+			// MariaDB executes the interior of /*M!NNNNNN ... */ conditional
+			// comments as normal SQL, so an apostrophe inside them is a string
+			// opener there but not elsewhere — fail closed like /*! ... */.
+			name:      "mariadb executable comment is fail closed",
+			sql:       "/*M!100000 UPDATE t SET a='*/', token='super-secret-token' */ -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "tidb executable comment is fail closed",
+			sql:       "/*T! UPDATE t SET a='*/', token='super-secret-token' */ -- '",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			// An ordinary comment mentioning MariaDB is not an executable
+			// comment opener and must keep passing through redacted.
+			name: "plain comment mentioning mariadb passes through",
+			sql:  "/* MariaDB note */ UPDATE t SET token='t1'",
+			want: "/*[REDACTED]*/ UPDATE t SET token='[REDACTED]'",
+		},
+		{
 			name:      "dollar identifier suffix parity inversion is fail closed",
 			sql:       "UPDATE t SET a$$='$$', token='super-secret-token' -- '",
 			want:      "[REDACTED]",
@@ -375,6 +397,15 @@ func TestRedactSQLStringLiteralsFailClosed(t *testing.T) {
 			sql:       "UPDATE clients SET a=:x(v1,token='super-secret-token'",
 			want:      "[REDACTED]",
 			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			// An unterminated Tcl-variable parenthesis reaching EOF with no
+			// quote, no whitespace, and no closing ')' exercises the trailing
+			// fail-closed return in hasUnsafeSQLiteVarParen.
+			name:      "sqlite tcl variable unterminated paren at eof is fail closed",
+			sql:       "UPDATE clients SET a=:x(v1",
+			want:      "[REDACTED]",
+			forbidden: []string{"UPDATE"},
 		},
 		{
 			name:      "postgres dollar quote parity inversion is fail closed",
