@@ -57,14 +57,8 @@ const maxConsecutiveDroppedFrames = 16
 
 // writeDeadline caps every frame write so a half-open peer (sleeping laptop,
 // dead reverse proxy) cannot block a writer goroutine forever on a full TCP
-// send buffer. controlWriteTimeout bounds how long a control frame may wait
-// for a stuck data write before scheduling a force-close of the connection,
-// and maxControlWaitCancel bounds that final wait.
-const (
-	writeDeadline        = 10 * time.Second
-	controlWriteTimeout  = 5 * time.Second
-	maxControlWaitCancel = 15 * time.Second
-)
+// send buffer.
+const writeDeadline = 10 * time.Second
 
 // SafeConn wraps a websocket connection with a mutex so concurrent writes
 // cannot interleave frames, and funnels every frame through the optional
@@ -164,10 +158,13 @@ func (sc *SafeConn) WriteMessage(messageType int, data []byte) error {
 	return sc.writeFrame(messageType, data)
 }
 
-// WriteControl sends a control frame. Control frames must not pile up behind
-// a data write stuck on a half-open peer: when sc.mu is not acquired within
-// controlWriteTimeout the connection is closed underneath the blocked writer
-// so both paths fail fast instead of deadlocking session cleanup.
+// WriteControl sends a control frame after the wsSend hook chain. gorilla
+// serializes control-frame writes through its own channel lock independently
+// of the data writer state, so this path neither takes sc.mu nor spawns a
+// helper goroutine. In particular a slow-but-legal data write cannot arm a
+// delayed force-close of an otherwise healthy connection. A zero deadline is
+// given the same bounded default as data frames; nonzero caller deadlines are
+// honored exactly.
 func (sc *SafeConn) WriteControl(messageType int, data []byte, deadline time.Time) error {
 	interceptor, info := sc.hookState()
 	newType, newData := messageType, data
@@ -178,81 +175,10 @@ func (sc *SafeConn) WriteControl(messageType int, data []byte, deadline time.Tim
 			return nil
 		}
 	}
-	if !sc.acquireWriteLock(controlWriteTimeout) {
-		return errWriteLockTimeout
-	}
-	defer sc.mu.Unlock()
 	if deadline.IsZero() {
 		deadline = time.Now().Add(writeDeadline)
 	}
 	return sc.conn.WriteControl(newType, newData, deadline)
-}
-
-var errWriteLockTimeout = errors.New("write lock timeout: closing half-open connection")
-
-// acquireWriteLock takes sc.mu but gives up (closing the connection) after
-// timeout so a control writer can always break a stuck data write. Close is
-// deferred to maxControlWaitCancel to give a slow-but-alive writer time to
-// finish before we pull the socket out from under it. When the caller gives
-// up the helper goroutine releases the mutex itself as soon as the stuck
-// writer unblocks, so the lock is never orphaned.
-func (sc *SafeConn) acquireWriteLock(timeout time.Duration) bool {
-	locked := make(chan struct{})
-	claimed := make(chan struct{})
-	abandon := make(chan struct{})
-	go func() {
-		sc.mu.Lock()
-		close(locked)
-		select {
-		case <-abandon:
-			// The caller gave up before or while the lock was acquired:
-			// release it immediately so the mutex is never orphaned.
-			sc.mu.Unlock()
-		case <-claimed:
-			// Ownership transferred to the caller, which unlocks after writing.
-		}
-	}()
-	claim := func() bool {
-		close(claimed)
-		return true
-	}
-	giveUp := func() bool {
-		close(abandon)
-		return false
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-locked:
-		return claim()
-	case <-sc.closeDone:
-		select {
-		case <-locked:
-			return claim()
-		default:
-			return giveUp()
-		}
-	case <-timer.C:
-		select {
-		case <-locked:
-			return claim()
-		default:
-		}
-		// A data frame write is stuck past its own deadline: the peer is
-		// half-open. Closing the socket is the only way to interrupt the
-		// kernel-level write(2) the mutex holder is parked in.
-		time.AfterFunc(maxControlWaitCancel, func() { _ = sc.Close() })
-		select {
-		case <-locked:
-			return claim()
-		case <-sc.closeDone:
-			return giveUp()
-		case <-time.After(maxControlWaitCancel + writeDeadline):
-			// The stuck writer never woke even after the socket close; give up
-			// rather than blocking the cleanup path forever.
-			return giveUp()
-		}
-	}
 }
 
 // WriteJSON encodes v then sends it as one text frame through the wsSend

@@ -31,6 +31,11 @@ type TerminalSession struct {
 	cleanupGen      uint64
 	cleanupDeadline time.Time
 
+	// controlMu 串行化同一会话的 ready/abort 控制状态转换。锁序固定为
+	// session.controlMu -> TerminalSessionsMutex；不得与 auditMu 嵌套。
+	// 其临界区内只做一次有界 socket 写/事件派发，绝不持 TerminalSessionsMutex 写 socket。
+	controlMu sync.Mutex
+
 	// 审计日志单条聚合状态：同一终端会话只写入一条日志，在重连/挂起/结束时原地更新。
 	// 锁顺序固定为 session.auditMu -> TerminalSessionsMutex，严禁反向加锁。
 	auditMu          sync.Mutex
@@ -224,33 +229,33 @@ func suspendSide(id string, conn *connection.SafeConn, matchBrowser bool) {
 	TerminalSessionsMutex.Unlock()
 
 	_ = conn.Close()
-	// 持锁期间不写 socket：写入可能阻塞，会拖住整个会话表。
-	// abort 发往 survivor 前重新核对会话身份：若在持锁之外对端已经重连
-	// （重挂 abort），旧连接断开的通知不得覆盖新世代的恢复状态。
-	if survivor != nil && isSessionSurvivor(id, session, survivor, matchBrowser) {
-		notifyAbort(survivor)
+	// 持全局表锁期间不写 socket：写入可能阻塞，会拖住整个会话表。controlMu
+	// 则把 abort 与后续 reattach 的 ready 串行化：若 reattach 已经先发出 ready，
+	// 这里的复核会看到被摘除槽位不再为空，旧 abort 不得后发覆盖新 ready。
+	if survivor == nil {
+		return
 	}
+	session.controlMu.Lock()
+	defer session.controlMu.Unlock()
+	TerminalSessionsMutex.Lock()
+	current := TerminalSessions[id]
+	alive := current == session
+	if alive {
+		if matchBrowser {
+			alive = current.Browser == nil && current.Agent == survivor
+		} else {
+			alive = current.Agent == nil && current.Browser == survivor
+		}
+	}
+	TerminalSessionsMutex.Unlock()
+	if !alive {
+		return
+	}
+	notifyAbort(survivor)
 	// 浏览器仍在线而被控端掉线时，主动重发终端请求唤醒被控端（兼容不自动重连的旧版 Agent）。
 	if clientUUID != "" {
 		dispatchTerminalRequest(clientUUID, id)
 	}
-}
-
-// isSessionSurvivor reports whether survivor is still the live peer of the
-// same session generation: the browser side checks the agent slot and vice
-// versa. A stale suspend that lost the race with a reattach must not abort
-// the freshly reconnected peer.
-func isSessionSurvivor(id string, session *TerminalSession, survivor *connection.SafeConn, browserDetached bool) bool {
-	TerminalSessionsMutex.Lock()
-	defer TerminalSessionsMutex.Unlock()
-	current := TerminalSessions[id]
-	if current == nil || current != session {
-		return false
-	}
-	if browserDetached {
-		return current.Agent == survivor
-	}
-	return current.Browser == survivor
 }
 
 func suspendBrowser(id string, conn *connection.SafeConn) { suspendSide(id, conn, true) }
@@ -355,9 +360,18 @@ func attachBrowserWithClientID(id, clientUUID, userUUID string, apiKey bool, con
 	}
 	// 重连的浏览器要立刻知道自己回到了哪一步：被控端已在位就算就绪；
 	// 同时通知被控端浏览器已恢复，便于被控端立即取消本地挂起倒计时（旧版被控端会前向兼容忽略 ready）。
+	// ready 与迟到的 abort 走同一个 controlMu 序列；发送前复核双边仍是目标连接。
 	if oldAgent != nil {
-		notifyReady(conn)
-		notifyReady(oldAgent)
+		session.controlMu.Lock()
+		TerminalSessionsMutex.Lock()
+		current := TerminalSessions[id]
+		stillCurrent := current == session && current.Browser == conn && current.Agent == oldAgent
+		TerminalSessionsMutex.Unlock()
+		if stillCurrent {
+			notifyReady(conn)
+			notifyReady(oldAgent)
+		}
+		session.controlMu.Unlock()
 	}
 	return session, oldAgent != nil, true
 }
@@ -391,9 +405,18 @@ func attachAgent(id string, conn *connection.SafeConn) (*TerminalSession, bool) 
 	if startPump {
 		go pumpAgentFrames(id, conn)
 	}
-	// 被控端就位：浏览器可以停止等待，转发随即开始。
+	// 被控端就位：浏览器可以停止等待，转发随即开始。ready 与迟到的 abort
+	// 走同一个 controlMu 序列；发送前复核双边仍是目标连接。
 	if oldBrowser != nil {
-		notifyReady(oldBrowser)
+		session.controlMu.Lock()
+		TerminalSessionsMutex.Lock()
+		current := TerminalSessions[id]
+		stillCurrent := current == session && current.Agent == conn && current.Browser == oldBrowser
+		TerminalSessionsMutex.Unlock()
+		if stillCurrent {
+			notifyReady(oldBrowser)
+		}
+		session.controlMu.Unlock()
 	}
 	return session, true
 }

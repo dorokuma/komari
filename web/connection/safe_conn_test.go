@@ -2,6 +2,7 @@ package connection
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -310,6 +311,81 @@ func TestSafeConnCloseDoesNotWaitForWriteLock(t *testing.T) {
 		t.Fatal("Close blocked behind the write mutex — half-open deadlock regression")
 	}
 	sc.mu.Unlock()
+}
+
+// nonReadingPeerServer upgrades a connection and intentionally never reads
+// from it, so a writer can fill the peer's TCP receive/send-buffer pipeline.
+func nonReadingPeerServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	var upgrader websocket.Upgrader
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+			_ = tcp.SetReadBuffer(4096)
+		}
+		defer conn.Close()
+		select {}
+	}))
+}
+
+// TestSafeConnWriteControlDeadlineAndCloseUnderTCPBackpressure uses a real
+// non-reading peer with shrunk TCP buffers and one very large data frame. The
+// frame blocks in the kernel rather than behind a test-controlled mutex. The
+// test pins the MF-1 contract end to end: WriteControl obeys its caller
+// deadline, no hidden force-close is armed by slow data writes, and an
+// explicit Close immediately interrupts the half-open writer.
+func TestSafeConnWriteControlDeadlineAndCloseUnderTCPBackpressure(t *testing.T) {
+	server := nonReadingPeerServer(t)
+	defer server.Close()
+	sc := dialEcho(t, server)
+	if tcp, ok := sc.GetConn().UnderlyingConn().(*net.TCPConn); ok {
+		_ = tcp.SetWriteBuffer(4096)
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- sc.WriteMessage(websocket.BinaryMessage, make([]byte, 16<<20))
+	}()
+
+	// Give the writer scheduler time to enter write(2), then verify that the
+	// large frame is genuinely still in flight. Completing a 16 MiB frame to a
+	// non-reading peer with 4 KiB buffers would itself indicate a test setup
+	// problem, not the production behavior being validated.
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case err := <-writeDone:
+		t.Fatalf("large frame unexpectedly completed before backpressure test (err=%v)", err)
+	default:
+	}
+
+	controlStarted := time.Now()
+	_ = sc.WriteControl(websocket.PingMessage, nil, time.Now().Add(60*time.Millisecond))
+	controlElapsed := time.Since(controlStarted)
+	if controlElapsed > 250*time.Millisecond {
+		t.Fatalf("WriteControl took %s with a 60ms deadline under TCP backpressure", controlElapsed)
+	}
+
+	select {
+	case <-sc.closeDone:
+		t.Fatal("connection was force-closed without an explicit Close")
+	default:
+	}
+
+	closeStarted := time.Now()
+	if err := sc.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if elapsed := time.Since(closeStarted); elapsed > 150*time.Millisecond {
+		t.Fatalf("Close took %s behind a half-open write", elapsed)
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Close did not interrupt the backpressured data writer")
+	}
 }
 
 // TestSafeConnOnCloseOnce 验证 Close 只触发一次 OnClose。

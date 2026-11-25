@@ -111,7 +111,10 @@ func adminGetClientTraffic(ctx context.Context, req *rpc.JsonRpcRequest) (any, *
 		UUID             string       `json:"uuid"`
 		CheckAgentConfig flexibleBool `json:"check_agent_config"`
 	}
-	if err := req.BindParams(&params); err != nil || strings.TrimSpace(params.UUID) == "" {
+	if err := req.BindParams(&params); err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "invalid uuid or check_agent_config value", nil)
+	}
+	if strings.TrimSpace(params.UUID) == "" {
 		return nil, rpc.MakeError(rpc.InvalidParams, "uuid is required", nil)
 	}
 	client, err := clients.GetClientByUUID(params.UUID)

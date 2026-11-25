@@ -133,6 +133,27 @@ func TestRedactionAndFormattingHelpers(t *testing.T) {
 	}
 }
 
+func TestWebhookBodyAndHeadersAreRedactedAcrossTypes(t *testing.T) {
+	if got := FormatValue("body", "secret-body"); got != "[BODY, 11 chars]" {
+		t.Fatalf("string body formatting = %q, want length-only redaction", got)
+	}
+	if got := FormatValue("headers", "Bearer secret-token"); got != "[BODY, 19 chars]" {
+		t.Fatalf("string headers formatting = %q, want length-only redaction", got)
+	}
+	for key, value := range map[string]any{
+		"body":    map[string]any{"token": "object-secret"},
+		"headers": map[string]any{"Authorization": "Bearer header-secret"},
+	} {
+		got := FormatValue(key, value)
+		if got != redactedPlaceholder {
+			t.Fatalf("%s object formatting = %q, want %s", key, got, redactedPlaceholder)
+		}
+		if strings.Contains(got, "secret") {
+			t.Fatalf("%s object formatting leaked secret: %q", key, got)
+		}
+	}
+}
+
 func TestLogWithIDAndUpdateMessage(t *testing.T) {
 	db := dbcore.GetDBInstance()
 	t.Cleanup(func() {

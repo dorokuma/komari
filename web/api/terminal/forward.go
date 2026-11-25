@@ -88,7 +88,7 @@ func ForwardTerminal(id string, browser, agent *connection.SafeConn) {
 	startBrowser, startAgent := false, false
 	// 先核对 RequesterIp 再递增状态：部署在 Unix Socket 或异常反代后时
 	// ClientIP 可能为空，此时必须直接退出，不能让 activeForwarders/auditConnects
-	// 泄浮雕住会话终态审计与后续转发。
+	// 泄漏卡住会话终态审计与后续转发。
 	if session != nil && session.Browser == browser && session.Agent == agent && session.RequesterIp != "" {
 		requesterIp, userUUID, clientUUID = session.RequesterIp, session.UserUUID, session.UUID
 		stopForwardWaitLocked(session)

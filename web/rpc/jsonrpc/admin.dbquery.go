@@ -335,46 +335,137 @@ func collectDatabaseRows(rows *sql.Rows, limit int) ([]string, [][]any, bool, er
 	return columns, resultRows, false, nil
 }
 
-// redactSQLStringLiterals replaces the contents of single-quoted SQL string
-// literals with a placeholder before they reach the audit log. Statements
-// legitimately executed through admin:dbExec can embed credentials verbatim
-// (UPDATE clients SET token='…'), and audit logs are queryable, backed up and
-// retained far beyond the database itself. This is a conservative lexical
-// scan honoring SQL ” escaping — not a parser — so it may redact a quoted
-// sequence inside a comment too, which is the safe direction.
+// redactSQLStringLiterals is a fail-closed lexical scanner for SQL audit
+// previews. It redacts single-quoted, double-quoted, and PostgreSQL
+// dollar-quoted literals while honoring SQL comments, quote doubling, backslash
+// escapes, and dollar-quote tags. Comments are retained only as redacted
+// placeholders because an apostrophe inside a comment must never flip quote
+// parity. Any unterminated or ambiguous construct downgrades the whole
+// statement preview rather than risking plaintext credential disclosure.
 func redactSQLStringLiterals(statement string) string {
 	var out strings.Builder
 	out.Grow(len(statement))
-	inLiteral := false
-	redacted := false
-	for i := 0; i < len(statement); i++ {
+	for i := 0; i < len(statement); {
 		ch := statement[i]
-		if !inLiteral {
-			if ch == '\'' {
-				inLiteral = true
-				redacted = false
-				out.WriteByte(ch)
-				continue
+		switch {
+		case ch == '-' && i+1 < len(statement) && statement[i+1] == '-':
+			out.WriteString("--[REDACTED]")
+			i += 2
+			for i < len(statement) && statement[i] != '\n' {
+				i++
+			}
+			if i < len(statement) {
+				out.WriteByte('\n')
+				i++
+			}
+		case ch == '/' && i+1 < len(statement) && statement[i+1] == '*':
+			next, ok := scanSQLBlockComment(statement, i)
+			if !ok {
+				return "[REDACTED]"
+			}
+			out.WriteString("/*[REDACTED]*/")
+			i = next
+		case ch == '\'' || ch == '"':
+			next, ok := scanSQLQuotedLiteral(statement, i, ch)
+			if !ok {
+				return "[REDACTED]"
 			}
 			out.WriteByte(ch)
-			continue
-		}
-		if ch == '\'' {
-			if i+1 < len(statement) && statement[i+1] == '\'' {
-				// Escaped quote inside the literal: consume both, stay redacted.
+			out.WriteString("[REDACTED]")
+			out.WriteByte(ch)
+			i = next
+		case ch == '$':
+			// PostgreSQL positional parameters ($1, $2, ...) are common and are
+			// not literals. Any other dollar-sign construct is treated as a
+			// potential dollar quote; if its tag cannot be recognized, the whole
+			// preview fails closed rather than risking a dialect mismatch.
+			if i+1 < len(statement) && statement[i+1] >= '0' && statement[i+1] <= '9' {
+				out.WriteByte(ch)
 				i++
 				continue
 			}
-			inLiteral = false
-			out.WriteByte(ch)
-			continue
-		}
-		if !redacted {
+			tagLen, ok := scanDollarQuoteTag(statement, i)
+			if !ok {
+				return "[REDACTED]"
+			}
+			tag := statement[i : i+tagLen]
+			end := strings.Index(statement[i+tagLen:], tag)
+			if end < 0 {
+				return "[REDACTED]"
+			}
+			out.WriteString(tag)
 			out.WriteString("[REDACTED]")
-			redacted = true
+			out.WriteString(tag)
+			i += tagLen + end + tagLen
+		default:
+			out.WriteByte(ch)
+			i++
 		}
 	}
 	return out.String()
+}
+
+// scanSQLBlockComment returns the byte index just after a block comment.
+// Nested openings are honored because PostgreSQL permits nested block comments;
+// treating them as ambiguous text would reopen the quote-parity attack.
+func scanSQLBlockComment(statement string, start int) (int, bool) {
+	depth := 1
+	for i := start + 2; i < len(statement); i++ {
+		if i+1 < len(statement) && statement[i] == '/' && statement[i+1] == '*' {
+			depth++
+			i++
+			continue
+		}
+		if i+1 < len(statement) && statement[i] == '*' && statement[i+1] == '/' {
+			depth--
+			i++
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// scanSQLQuotedLiteral returns the byte index just after a quoted literal
+// starting at start. SQL quote doubling keeps the scanner inside the literal;
+// a backslash escapes the following byte for MySQL compatibility and is
+// conservative for dialects that do not use backslash escapes.
+func scanSQLQuotedLiteral(statement string, start int, quote byte) (int, bool) {
+	for i := start + 1; i < len(statement); i++ {
+		switch statement[i] {
+		case '\\':
+			i++
+		case quote:
+			if i+1 < len(statement) && statement[i+1] == quote {
+				i++
+				continue
+			}
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+
+// scanDollarQuoteTag recognizes PostgreSQL $tag$ openings. The tag may be
+// empty or contain letters, digits, and underscores, but may not start with a
+// digit or contain a dollar sign.
+func scanDollarQuoteTag(statement string, start int) (int, bool) {
+	if start >= len(statement) || statement[start] != '$' {
+		return 0, false
+	}
+	for i := start + 1; i < len(statement); i++ {
+		ch := statement[i]
+		if ch == '$' {
+			return i - start + 1, true
+		}
+		letter := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
+		digit := ch >= '0' && ch <= '9'
+		if !(letter || digit || ch == '_') || (digit && i == start+1) {
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 func normalizeDatabaseValue(value any) any {

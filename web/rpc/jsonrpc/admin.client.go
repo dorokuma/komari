@@ -202,15 +202,13 @@ func adminRemoveClient(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.
 		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid or missing UUID", nil)
 	}
 	existing, existingErr := clients.GetClientByUUID(params.UUID)
-	// Delete the client row first: only after that succeeds is the traffic
-	// ledger removed, so a failed deletion never loses the ledger's
-	// calibration offsets while UpdateConfig still re-verifies client
-	// existence inside its own transaction.
-	if err := clients.DeleteClient(params.UUID); err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, "Failed to delete client"+err.Error(), nil)
-	}
-	if err := trafficledger.DeleteClient(params.UUID); err != nil {
-		return nil, rpc.MakeError(rpc.InternalError, "Failed to delete client traffic ledger: "+err.Error(), nil)
+	// Delete the client row and traffic ledger row atomically. Only after that
+	// single transaction commits do we run runtime cleanup, alert resets,
+	// metric deletion, and audit logging; a failed deletion therefore leaves
+	// both rows intact and does not create an orphaned ledger or half-cleaned
+	// runtime state.
+	if err := trafficledger.DeleteClientWithRecord(ctx, params.UUID); err != nil {
+		return nil, rpc.MakeError(rpc.InternalError, "Failed to delete client and traffic ledger: "+err.Error(), nil)
 	}
 	terminal.CloseSessionsByClientUUID(params.UUID)
 	notifier.ResetTrafficAlertState(params.UUID)

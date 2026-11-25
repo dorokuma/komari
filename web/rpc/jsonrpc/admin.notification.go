@@ -94,23 +94,9 @@ func sanitizeNotificationChannelAuditMap(data map[string]any) map[string]any {
 	for k, v := range data {
 		lower := strings.ToLower(strings.TrimSpace(k))
 		switch lower {
-		case "headers":
-			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-				out[k] = "[REDACTED]"
-			} else {
-				out[k] = v
-			}
 		case "script":
 			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
 				out[k] = fmt.Sprintf("[SCRIPT, %d chars]", utf8.RuneCountInString(s))
-			} else {
-				out[k] = v
-			}
-		case "body":
-			// Webhook bodies routinely embed tokens or signed payloads required
-			// by the target service; never persist them into audit logs.
-			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-				out[k] = fmt.Sprintf("[BODY, %d chars]", utf8.RuneCountInString(s))
 			} else {
 				out[k] = v
 			}

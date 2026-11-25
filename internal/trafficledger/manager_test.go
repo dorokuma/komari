@@ -524,6 +524,88 @@ func TestShutdownPersistsFinalObservations(t *testing.T) {
 	}
 }
 
+// TestShutdownFailureCanRetryFinalFlush verifies that a failed final flush
+// does not latch the manager into a false successful stopped state: residual
+// dirty rows and closures are retried and persisted by a repeated Shutdown.
+func TestShutdownFailureCanRetryFinalFlush(t *testing.T) {
+	manager, db := newTestManager(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := manager.UpdateConfig(ctx, "node-1", UpdateConfigRequest{CycleConfig: monthlyConfig()}, reportPtr("node-1", now, 100, 200, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ObserveReport(reportAt("node-1", now.Add(time.Minute), 160, 260, 1060)); err != nil {
+		t.Fatal(err)
+	}
+
+	failures := 1
+	manager.SetCycleCloseHook(func(tx *gorm.DB, closures []ClosedCycleSnapshot) error {
+		if failures > 0 {
+			failures--
+			return errors.New("injected final flush failure")
+		}
+		return nil
+	})
+	manager.mu.Lock()
+	manager.nextClosure = 1
+	manager.closures = append(manager.closures, queuedClose{
+		sequence: 1,
+		snapshot: closeSnapshot(manager.entries["node-1"].row, now, CloseReasonManualReset),
+	})
+	manager.mu.Unlock()
+
+	if err := manager.Shutdown(ctx); err == nil || !strings.Contains(err.Error(), "injected final flush failure") {
+		t.Fatalf("first shutdown error = %v, want injected failure", err)
+	}
+	if err := manager.Shutdown(ctx); err != nil {
+		t.Fatalf("retry shutdown = %v, want nil", err)
+	}
+	var persisted models.ClientTrafficLedger
+	if err := db.First(&persisted, "uuid = ?", "node-1").Error; err != nil {
+		t.Fatalf("load persisted ledger after retry: %v", err)
+	}
+	if persisted.AccumulatedUp != 60 || persisted.AccumulatedDown != 60 {
+		t.Fatalf("persisted accumulation after retry = up %d down %d, want 60/60", persisted.AccumulatedUp, persisted.AccumulatedDown)
+	}
+	manager.mu.RLock()
+	stillDirty := manager.entries["node-1"].dirty
+	manager.mu.RUnlock()
+	if stillDirty {
+		t.Fatal("successful shutdown retry left the entry dirty")
+	}
+	if err := manager.Shutdown(ctx); err != nil {
+		t.Fatalf("third shutdown after successful retry = %v, want nil", err)
+	}
+}
+
+// TestDeleteClientWithRecordIsAtomic verifies that the atomic removal entry
+// deletes the client and ledger together and removes the in-memory entry only
+// after commit.
+func TestDeleteClientWithRecordIsAtomic(t *testing.T) {
+	manager, db := newTestManager(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := manager.UpdateConfig(ctx, "node-1", UpdateConfigRequest{CycleConfig: monthlyConfig()}, reportPtr("node-1", now, 100, 200, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.DeleteClientWithRecord(ctx, "node-1"); err != nil {
+		t.Fatalf("DeleteClientWithRecord: %v", err)
+	}
+	var clientCount, ledgerCount int64
+	if err := db.Model(&models.Client{}).Where("uuid = ?", "node-1").Count(&clientCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.ClientTrafficLedger{}).Where("uuid = ?", "node-1").Count(&ledgerCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if clientCount != 0 || ledgerCount != 0 {
+		t.Fatalf("counts after atomic delete = clients %d ledgers %d, want 0/0", clientCount, ledgerCount)
+	}
+	if _, ok := manager.Get("node-1"); ok {
+		t.Fatal("in-memory ledger entry survived atomic delete")
+	}
+}
+
 // TestSetDefaultTimezoneBackwardShiftPreservesUsage guards the reverse
 // direction of timezone inheritance refresh: moving the inherited timezone
 // backwards (Asia/Tokyo -> UTC) shifts the cycle start later in absolute time

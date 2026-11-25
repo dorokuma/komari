@@ -350,6 +350,19 @@ func FormatValue(key string, value any) string {
 		return redactedPlaceholder
 	}
 	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	if lowerKey == "body" || lowerKey == "headers" {
+		// Webhook/notification bodies and header payloads are free-form secrets
+		// carriers regardless of their JSON type. Strings are summarized by
+		// length; objects, arrays, numbers, and other non-string values are
+		// fully redacted because serializing them could disclose tokens.
+		if isEmptyValue(value) {
+			return "(empty)"
+		}
+		if s, ok := value.(string); ok {
+			return fmt.Sprintf("[BODY, %d chars]", utf8.RuneCountInString(strings.TrimSpace(s)))
+		}
+		return redactedPlaceholder
+	}
 	if value == nil {
 		return "null"
 	}
@@ -357,14 +370,6 @@ func FormatValue(key string, value any) string {
 	case string:
 		trimmed := strings.TrimSpace(v)
 		switch {
-		case lowerKey == "body":
-			// Webhook/notification bodies are free-form templates that can embed
-			// tokens or signed payloads required by the target service; only
-			// their length is safe to record.
-			if trimmed == "" {
-				return `""`
-			}
-			return fmt.Sprintf("[BODY, %d chars]", utf8.RuneCountInString(trimmed))
 		case strings.Contains(lowerKey, "dsn"):
 			return strconv.Quote(Truncate(RedactDSN(trimmed), defaultValueMaxRunes))
 		case lowerKey == "url" || strings.HasSuffix(lowerKey, "_url") || strings.HasSuffix(lowerKey, "url"):

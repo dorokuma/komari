@@ -41,15 +41,16 @@ type queuedClose struct {
 type Manager struct {
 	db *gorm.DB
 
-	mu              sync.RWMutex
-	flushMu         sync.Mutex
-	defaultTimezone string
-	entries         map[string]*ledgerEntry
-	closures        []queuedClose
-	nextClosure     uint64
-	hook            CycleCloseHook
-	initialized     bool
-	stopped         bool
+	mu               sync.RWMutex
+	flushMu          sync.Mutex
+	defaultTimezone  string
+	entries          map[string]*ledgerEntry
+	closures         []queuedClose
+	nextClosure      uint64
+	hook             CycleCloseHook
+	initialized      bool
+	stopped          bool
+	flushedAfterStop bool
 }
 
 func NewManager(db *gorm.DB, defaultTimezone string) *Manager {
@@ -357,7 +358,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	defer m.flushMu.Unlock()
 
 	m.mu.Lock()
-	if m.stopped {
+	if m.stopped && m.flushedAfterStop {
 		m.mu.Unlock()
 		return nil
 	}
@@ -366,13 +367,19 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		return ErrManagerNotInitialized
 	}
 	// Stop accepting new observations before snapshotting so every accepted
-	// sample is either already in the snapshot or rejected from here on.
+	// sample is either already in the snapshot or rejected from here on. If the
+	// final transaction fails, flushedAfterStop remains false and a repeated
+	// Shutdown snapshots and retries the residual dirty rows/closures instead
+	// of silently reporting success.
 	m.stopped = true
 	snap := m.snapshotDirtyLocked(time.Now().UTC())
 	_, maxSeq := m.snapshotClosuresLocked(nil)
 	m.mu.Unlock()
 
 	if len(snap.rows) == 0 && len(snap.closures) == 0 {
+		m.mu.Lock()
+		m.flushedAfterStop = true
+		m.mu.Unlock()
 		return nil
 	}
 	if err := m.commitFlushSnapshot(ctx, snap); err != nil {
@@ -381,6 +388,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 
 	m.mu.Lock()
 	m.settleFlushLocked(snap, maxSeq)
+	m.flushedAfterStop = true
 	m.mu.Unlock()
 	return nil
 }
@@ -684,19 +692,57 @@ func (m *Manager) DeleteClient(uuid string) error {
 		extraCloses = append(extraCloses, closeSnapshot(entry.row, time.Now().UTC(), CloseReasonClientDeleted))
 	}
 	closures, maxSeq := m.snapshotClosuresLocked(extraCloses)
-	if err := m.db.Transaction(func(tx *gorm.DB) error {
+	if err := m.deleteClientRowsTransaction(context.Background(), uuid, false, closures); err != nil {
+		return fmt.Errorf("delete client traffic ledger: %w", err)
+	}
+	delete(m.entries, uuid)
+	m.trimClosuresLocked(maxSeq)
+	return nil
+}
+
+// DeleteClientWithRecord atomically deletes the client row and its traffic
+// ledger row in one database transaction, including any queued cycle-close
+// hook writes. The in-memory entry is removed only after the transaction
+// commits, so a failed deletion leaves both the database and memory unchanged.
+func (m *Manager) DeleteClientWithRecord(ctx context.Context, uuid string) error {
+	if uuid == "" {
+		return errors.New("client UUID is required")
+	}
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.requireRunningLocked(); err != nil {
+		return err
+	}
+
+	var extraCloses []ClosedCycleSnapshot
+	if entry := m.entries[uuid]; entry != nil && entry.row.Mode != ModeAgent && entry.row.CycleStartAt != nil {
+		extraCloses = append(extraCloses, closeSnapshot(entry.row, time.Now().UTC(), CloseReasonClientDeleted))
+	}
+	closures, maxSeq := m.snapshotClosuresLocked(extraCloses)
+	if err := m.deleteClientRowsTransaction(ctx, uuid, true, closures); err != nil {
+		return fmt.Errorf("delete client and traffic ledger: %w", err)
+	}
+	delete(m.entries, uuid)
+	m.trimClosuresLocked(maxSeq)
+	return nil
+}
+
+func (m *Manager) deleteClientRowsTransaction(ctx context.Context, uuid string, deleteClient bool, closures []ClosedCycleSnapshot) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if deleteClient {
+			if err := tx.Delete(&models.Client{}, "uuid = ?", uuid).Error; err != nil {
+				return err
+			}
+		}
 		if len(closures) > 0 && m.hook != nil {
 			if err := m.hook(tx, closures); err != nil {
 				return err
 			}
 		}
 		return tx.Delete(&models.ClientTrafficLedger{}, "uuid = ?", uuid).Error
-	}); err != nil {
-		return fmt.Errorf("delete client traffic ledger: %w", err)
-	}
-	delete(m.entries, uuid)
-	m.trimClosuresLocked(maxSeq)
-	return nil
+	})
 }
 
 // --- internal helpers ---
@@ -1069,6 +1115,16 @@ func DeleteClient(uuid string) error {
 		return err
 	}
 	return m.DeleteClient(uuid)
+}
+
+// DeleteClientWithRecord is the process-wide atomic client+ledger deletion
+// entry point used by admin removal.
+func DeleteClientWithRecord(ctx context.Context, uuid string) error {
+	m, err := getOrInitDefault(ctx)
+	if err != nil {
+		return err
+	}
+	return m.DeleteClientWithRecord(ctx, uuid)
 }
 
 func SetCycleCloseHook(hook CycleCloseHook) {

@@ -10,6 +10,8 @@ import (
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
 	"github.com/komari-monitor/komari/pkg/rpc"
+	"github.com/komari-monitor/komari/utils/messageSender"
+	"github.com/komari-monitor/komari/utils/messageSender/webhook"
 )
 
 func testAuditContext(ip, userUUID string) context.Context {
@@ -161,6 +163,144 @@ func TestSettingsAndDBExecAuditLogsRetainContextAndRedactSecrets(t *testing.T) {
 	}
 	if strings.Contains(sqlLog.Message, "non-existent-uuid") {
 		t.Fatalf("dbExec audit log should not record raw positional args:\n%s", sqlLog.Message)
+	}
+}
+
+// TestRedactSQLStringLiteralsFailClosed pins the audit redaction lexer against
+// quote-parity attacks: comments, escapes, double-quoted literals, PostgreSQL
+// dollar quotes, and unterminated input must never expose embedded credentials.
+func TestRedactSQLStringLiteralsFailClosed(t *testing.T) {
+	cases := []struct {
+		name      string
+		sql       string
+		want      string
+		forbidden []string
+	}{
+		{
+			name:      "line comment apostrophe does not flip parity",
+			sql:       "-- don't break prod\nUPDATE clients SET token='super-secret-token' WHERE uuid='u1'",
+			want:      "--[REDACTED]\nUPDATE clients SET token='[REDACTED]' WHERE uuid='[REDACTED]'",
+			forbidden: []string{"super-secret-token", "u1"},
+		},
+		{
+			name:      "block comment apostrophe does not flip parity",
+			sql:       "/* user's token */ UPDATE clients SET token='block-secret'",
+			want:      "/*[REDACTED]*/ UPDATE clients SET token='[REDACTED]'",
+			forbidden: []string{"user", "block-secret"},
+		},
+		{
+			name:      "double quoted literal redacted",
+			sql:       `UPDATE clients SET token="double-secret" WHERE uuid='u1'`,
+			forbidden: []string{"double-secret", "u1"},
+		},
+		{
+			name:      "mysql backslash escape keeps following literal redacted",
+			sql:       `UPDATE t SET note='a\'b', token='backslash-secret'`,
+			forbidden: []string{"backslash-secret"},
+		},
+		{
+			name:      "postgres dollar quoted literal redacted",
+			sql:       `UPDATE t SET token=$$dollar-secret$$, note=$tag$tag-secret$tag$`,
+			forbidden: []string{"dollar-secret", "tag-secret"},
+		},
+		{
+			name:      "nested block comment does not reopen parity",
+			sql:       "/* outer /* inner */ still comment */ UPDATE t SET token='nested-secret'",
+			forbidden: []string{"nested-secret"},
+		},
+		{
+			name: "postgres positional parameters remain visible",
+			sql:  "UPDATE clients SET token=$1 WHERE uuid=$2",
+			want: "UPDATE clients SET token=$1 WHERE uuid=$2",
+		},
+		{
+			name:      "ambiguous dollar input is globally fail closed",
+			sql:       "UPDATE t SET note=$unterminated_tag secret='x'",
+			want:      "[REDACTED]",
+			forbidden: []string{"secret", "UPDATE"},
+		},
+		{
+			name:      "unterminated quote is globally fail closed",
+			sql:       "UPDATE clients SET token='unclosed-secret",
+			want:      "[REDACTED]",
+			forbidden: []string{"unclosed-secret", "UPDATE"},
+		},
+		{
+			name:      "unterminated block comment is globally fail closed",
+			sql:       "UPDATE clients /* unclosed comment SET token='secret'",
+			want:      "[REDACTED]",
+			forbidden: []string{"secret", "UPDATE"},
+		},
+	}
+	for _, tc := range cases {
+		got := redactSQLStringLiterals(tc.sql)
+		if tc.want != "" && got != tc.want {
+			t.Fatalf("%s: redacted SQL = %q, want %q", tc.name, got, tc.want)
+		}
+		for _, secret := range tc.forbidden {
+			if strings.Contains(got, secret) {
+				t.Fatalf("%s: redacted SQL leaked %q:\n%s", tc.name, secret, got)
+			}
+		}
+	}
+}
+
+func TestWebhookChannelAuditRedactsBodyAndHeadersOnce(t *testing.T) {
+	if !messageSender.NotificationChannelRegistered("webhook") {
+		if err := webhook.Register(); err != nil {
+			t.Fatalf("register webhook channel: %v", err)
+		}
+	}
+	db := dbcore.GetDBInstance()
+	t.Cleanup(func() {
+		db.Where("name = ?", "webhook").Delete(&models.MessageSenderProvider{})
+	})
+
+	ctx := testAuditContext("192.0.2.13", "actor-admin-webhook")
+	bodyPayload := strings.Repeat("x", 55)
+	headerPayload := "Bearer header-secret-value"
+	if _, rpcErr := adminSetNotificationChannelConfiguration(ctx, &rpc.JsonRpcRequest{
+		Version: rpc.RPC_VERSION,
+		Method:  "admin:setNotificationChannelConfiguration",
+		Params: map[string]any{
+			"id": "webhook",
+			"data": map[string]any{
+				"url":     "https://example.invalid/hook",
+				"body":    bodyPayload,
+				"headers": headerPayload,
+			},
+		},
+	}); rpcErr != nil {
+		t.Fatalf("set webhook string config: %v", rpcErr)
+	}
+	stringLog := latestAuditLog(t)
+	if !strings.Contains(stringLog.Message, "body=[BODY, 55 chars]") || !strings.Contains(stringLog.Message, "headers=[BODY, 26 chars]") {
+		t.Fatalf("webhook audit did not preserve true body/header lengths once:\n%s", stringLog.Message)
+	}
+	if strings.Contains(stringLog.Message, "[BODY, 16 chars]") || strings.Contains(stringLog.Message, bodyPayload) || strings.Contains(stringLog.Message, headerPayload) {
+		t.Fatalf("webhook audit double-wrapped or leaked secrets:\n%s", stringLog.Message)
+	}
+
+	if _, rpcErr := adminSetNotificationChannelConfiguration(ctx, &rpc.JsonRpcRequest{
+		Version: rpc.RPC_VERSION,
+		Method:  "admin:setNotificationChannelConfiguration",
+		Params: map[string]any{
+			"id": "webhook",
+			"data": map[string]any{
+				"url":     "https://example.invalid/hook",
+				"body":    map[string]any{"token": "object-body-secret"},
+				"headers": map[string]any{"Authorization": "object-header-secret"},
+			},
+		},
+	}); rpcErr != nil {
+		t.Fatalf("set webhook object config: %v", rpcErr)
+	}
+	objectLog := latestAuditLog(t)
+	if !strings.Contains(objectLog.Message, "body=[REDACTED]") || !strings.Contains(objectLog.Message, "headers=[REDACTED]") {
+		t.Fatalf("webhook audit did not redact object body/headers:\n%s", objectLog.Message)
+	}
+	if strings.Contains(objectLog.Message, "object-body-secret") || strings.Contains(objectLog.Message, "object-header-secret") {
+		t.Fatalf("webhook audit leaked object secrets:\n%s", objectLog.Message)
 	}
 }
 

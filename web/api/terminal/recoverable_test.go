@@ -75,10 +75,9 @@ func TestSuspendedSessionDoesNotExtendCleanupOnAgentChurn(t *testing.T) {
 	// deadline the session must be gone right around the first deadline even
 	// though reconnect churn never stopped.
 	churnStarted := time.Now()
-	latestAgentClient := agent1Client
 	latestAgentSafe := agent1Safe
 	churnedPastDeadline := false
-	for time.Since(churnStarted) < 150*time.Millisecond {
+	for time.Since(churnStarted) < 240*time.Millisecond {
 		time.Sleep(25 * time.Millisecond)
 		suspendAgent("session-agent-churn", latestAgentSafe)
 
@@ -89,8 +88,7 @@ func TestSuspendedSessionDoesNotExtendCleanupOnAgentChurn(t *testing.T) {
 			break
 		}
 		latestAgentSafe = nextSafe
-		latestAgentClient = nextClient
-		if time.Since(churnStarted) > 120*time.Millisecond {
+		if time.Since(churnStarted) > 175*time.Millisecond {
 			churnedPastDeadline = true
 		}
 	}
@@ -112,8 +110,6 @@ func TestSuspendedSessionDoesNotExtendCleanupOnAgentChurn(t *testing.T) {
 			if !peekTerminatedSession("session-agent-churn", true, "client-a") {
 				t.Fatal("expired session was not recorded in terminatedSessions")
 			}
-			// If an agent was attached at expiry, it should receive terminate.
-			_ = latestAgentClient.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -147,7 +143,7 @@ func TestSuspendedSessionDoesNotExtendCleanupOnBrowserChurn(t *testing.T) {
 	currentBrowser := browser1Safe
 	churnStarted := time.Now()
 	churnedPastDeadline := false
-	for time.Since(churnStarted) < 150*time.Millisecond {
+	for time.Since(churnStarted) < 240*time.Millisecond {
 		time.Sleep(25 * time.Millisecond)
 		suspendBrowser("session-browser-churn", currentBrowser)
 
@@ -157,7 +153,7 @@ func TestSuspendedSessionDoesNotExtendCleanupOnBrowserChurn(t *testing.T) {
 			break
 		}
 		currentBrowser = nextSafe
-		if time.Since(churnStarted) > 120*time.Millisecond {
+		if time.Since(churnStarted) > 175*time.Millisecond {
 			churnedPastDeadline = true
 		}
 	}
