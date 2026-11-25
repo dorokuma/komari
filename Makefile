@@ -3,7 +3,7 @@
 # 因此 gofmt 门禁只约束相对 upstream/main 新增或修改的 .go 文件（增量零差异）。
 .PHONY: check fmt-check vet test race build-check build
 
-RACE_PKGS := ./pkg/metric/ ./internal/metricstore/ ./internal/plugin/ ./web/connection/ ./web/api/terminal/ ./internal/localping/... ./utils/... ./web/rpc/jsonrpc/ ./web/public/ ./database/tasks/
+RACE_PKGS := ./pkg/metric/ ./internal/metricstore/ ./internal/plugin/ ./web/connection/ ./web/api/terminal/ ./internal/localping/... ./utils/... ./web/rpc/jsonrpc/ ./web/public/ ./database/tasks/ ./internal/trafficledger/
 
 # 增量 gofmt 基线：优先 upstream/main；离线隔离 clone（origin 已移除、无 upstream
 # 远端）时回退到上游分叉基线 commit，保证 make check 不依赖远端引用。

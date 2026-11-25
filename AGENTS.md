@@ -19,7 +19,7 @@
 - 增量 `gofmt` 零差异：仅检查相对 `upstream/main`（离线回退分叉基线 commit）新增/修改的 `.go`（上游存量为 CRLF 行尾，全仓 `gofmt -l` 会报 ~327 个历史文件，见下「分歧」）；
 - `go vet ./...`；
 - `go test ./... -count=1`；
-- `RACE_PKGS` 关键并发包 `-race`：`pkg/metric`、`internal/metricstore`、`internal/plugin`、`web/connection`、`web/api/terminal`、`internal/localping`、`utils`、`web/rpc/jsonrpc`、`web/public`、`database/tasks`；
+- `RACE_PKGS` 关键并发包 `-race`：`pkg/metric`、`internal/metricstore`、`internal/plugin`、`web/connection`、`web/api/terminal`、`internal/localping`、`utils`、`web/rpc/jsonrpc`、`web/public`、`database/tasks`、`internal/trafficledger`；
 - `build-check`：编译二进制到临时文件后立即删除（依赖下述嵌入产物）。
 
 `make build`：编译二进制 `komari`（依赖下述嵌入产物）。
