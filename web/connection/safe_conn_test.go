@@ -318,6 +318,8 @@ func TestSafeConnCloseDoesNotWaitForWriteLock(t *testing.T) {
 func nonReadingPeerServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	var upgrader websocket.Upgrader
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -327,7 +329,7 @@ func nonReadingPeerServer(t *testing.T) *httptest.Server {
 			_ = tcp.SetReadBuffer(4096)
 		}
 		defer conn.Close()
-		select {}
+		<-done
 	}))
 }
 

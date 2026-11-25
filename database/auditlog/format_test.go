@@ -152,6 +152,19 @@ func TestWebhookBodyAndHeadersAreRedactedAcrossTypes(t *testing.T) {
 			t.Fatalf("%s object formatting leaked secret: %q", key, got)
 		}
 	}
+
+	// A non-string script payload is a free-form secret carrier as well:
+	// serializing the object would disclose embedded tokens.
+	got := FormatValue("script", map[string]any{"token": "script-object-secret"})
+	if got != redactedPlaceholder {
+		t.Fatalf("script object formatting = %q, want %s", got, redactedPlaceholder)
+	}
+	if strings.Contains(got, "script-object-secret") {
+		t.Fatalf("script object formatting leaked secret: %q", got)
+	}
+	if got := FormatValue("script", "echo hello"); got != `"echo hello"` {
+		t.Fatalf("script string formatting = %q, want plain quoted string", got)
+	}
 }
 
 func TestLogWithIDAndUpdateMessage(t *testing.T) {

@@ -231,17 +231,71 @@ func TestRedactSQLStringLiteralsFailClosed(t *testing.T) {
 			want:      "[REDACTED]",
 			forbidden: []string{"secret", "UPDATE"},
 		},
+		{
+			// SQLite/PostgreSQL treat a backslash as a plain byte, so 'C:\' is a
+			// closed literal; MySQL treats the backslash as an escape. The odd
+			// backslash run before the quote is dialect-ambiguous and must fail
+			// closed instead of flipping quote parity.
+			name:      "sqlite backslash-ending literal with line comment is fail closed",
+			sql:       `UPDATE clients SET remark='C:\', token='super-secret-token' -- don't`,
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "sqlite double-quoted backslash-ending literal is fail closed",
+			sql:       `UPDATE clients SET remark="C:\", token="super-secret-token" -- a"b`,
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "mysql hash comment apostrophe cannot flip parity",
+			sql:       "# don't break prod\nUPDATE t SET token='super-secret-token' # isn't logged",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "backtick identifier apostrophe stays inside identifier",
+			sql:       "UPDATE t SET `don't`=1, token='super-secret-token', `can't`=2",
+			want:      "UPDATE t SET `don't`=1, token='[REDACTED]', `can't`=2",
+			forbidden: []string{"super-secret-token"},
+		},
+		{
+			name:      "bracket identifier containing quote is fail closed",
+			sql:       "UPDATE t SET [don't]=1, token='super-secret-token'",
+			want:      "[REDACTED]",
+			forbidden: []string{"super-secret-token", "UPDATE"},
+		},
+		{
+			name:      "mysql hex literal is redacted",
+			sql:       "UPDATE t SET token=0x736563726574 WHERE id=1",
+			want:      "UPDATE t SET token=0x[REDACTED] WHERE id=1",
+			forbidden: []string{"736563726574"},
+		},
+		{
+			name:      "even backslash run before quote closes normally",
+			sql:       `UPDATE t SET path='C:\\', token='even-secret'`,
+			want:      "UPDATE t SET path='[REDACTED]', token='[REDACTED]'",
+			forbidden: []string{"even-secret", "C:\\"},
+		},
+		{
+			name:      "backslash before non-quote byte keeps structure",
+			sql:       `UPDATE t SET path='C:\Users\admin', token='path-secret'`,
+			want:      "UPDATE t SET path='[REDACTED]', token='[REDACTED]'",
+			forbidden: []string{"path-secret", "C:\\Users"},
+		},
 	}
 	for _, tc := range cases {
-		got := redactSQLStringLiterals(tc.sql)
-		if tc.want != "" && got != tc.want {
-			t.Fatalf("%s: redacted SQL = %q, want %q", tc.name, got, tc.want)
-		}
-		for _, secret := range tc.forbidden {
-			if strings.Contains(got, secret) {
-				t.Fatalf("%s: redacted SQL leaked %q:\n%s", tc.name, secret, got)
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactSQLStringLiterals(tc.sql)
+			if tc.want != "" && got != tc.want {
+				t.Fatalf("redacted SQL = %q, want %q", got, tc.want)
 			}
-		}
+			for _, secret := range tc.forbidden {
+				if strings.Contains(got, secret) {
+					t.Fatalf("redacted SQL leaked %q:\n%s", secret, got)
+				}
+			}
+		})
 	}
 }
 
@@ -301,6 +355,29 @@ func TestWebhookChannelAuditRedactsBodyAndHeadersOnce(t *testing.T) {
 	}
 	if strings.Contains(objectLog.Message, "object-body-secret") || strings.Contains(objectLog.Message, "object-header-secret") {
 		t.Fatalf("webhook audit leaked object secrets:\n%s", objectLog.Message)
+	}
+
+	// A non-string script payload must fail closed instead of serializing
+	// embedded tokens into the audit log.
+	if _, rpcErr := adminSetNotificationChannelConfiguration(ctx, &rpc.JsonRpcRequest{
+		Version: rpc.RPC_VERSION,
+		Method:  "admin:setNotificationChannelConfiguration",
+		Params: map[string]any{
+			"id": "webhook",
+			"data": map[string]any{
+				"url":    "https://example.invalid/hook",
+				"script": map[string]any{"token": "script-object-secret"},
+			},
+		},
+	}); rpcErr != nil {
+		t.Fatalf("set webhook object script config: %v", rpcErr)
+	}
+	scriptLog := latestAuditLog(t)
+	if !strings.Contains(scriptLog.Message, "script=[REDACTED]") {
+		t.Fatalf("webhook audit did not redact object script:\n%s", scriptLog.Message)
+	}
+	if strings.Contains(scriptLog.Message, "script-object-secret") {
+		t.Fatalf("webhook audit leaked object script secret:\n%s", scriptLog.Message)
 	}
 }
 
