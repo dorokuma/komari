@@ -174,6 +174,10 @@ func registerAdminRoutes(r *gin.Engine) {
 		clientGroup.GET("/:uuid", jsonRpc.Bind("admin:getClient", jsonRpc.WithPath("uuid"), jsonRpc.WithRaw()))
 		clientGroup.POST("/:uuid/edit", jsonRpc.Bind("admin:editClient", jsonRpc.WithPath("uuid")))
 		clientGroup.POST("/:uuid/remove", jsonRpc.Bind("admin:removeClient", jsonRpc.WithPath("uuid")))
+		clientGroup.GET("/:uuid/traffic", jsonRpc.Bind("admin:getClientTraffic", jsonRpc.WithPath("uuid"), jsonRpc.WithQuery("check_agent_config")))
+		clientGroup.POST("/:uuid/traffic/config", jsonRpc.Bind("admin:updateClientTrafficConfig", jsonRpc.WithPath("uuid")))
+		clientGroup.POST("/:uuid/traffic/calibrate", jsonRpc.Bind("admin:calibrateClientTraffic", jsonRpc.WithPath("uuid")))
+		clientGroup.POST("/:uuid/traffic/reset", jsonRpc.Bind("admin:resetClientTrafficCycle", jsonRpc.WithPath("uuid")))
 		clientGroup.GET("/:uuid/token", jsonRpc.Bind("admin:getClientToken", jsonRpc.WithPath("uuid"), jsonRpc.WithFlat()))
 		clientGroup.POST("/order", jsonRpc.Bind("admin:orderClients"))
 		// RequestTerminal validates 2FA only when creating a new session. Reattach
@@ -201,7 +205,7 @@ func registerAdminRoutes(r *gin.Engine) {
 		session.POST("/remove/all", jsonRpc.Bind("admin:deleteAllSessions"))
 	}
 
-	g.GET("/logs", jsonRpc.Bind("admin:getLogs", jsonRpc.WithQuery("limit", "page")))
+	g.GET("/logs", jsonRpc.Bind("admin:getLogs", jsonRpc.WithQuery("limit", "page", "msg_type", "q")))
 
 	// plugins: 安装流程通过统一的分片上传接口，启停/列表/日志走 RPC2，市场对齐主题市场。
 	pluginGroup := g.Group("/plugin")

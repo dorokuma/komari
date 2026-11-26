@@ -20,6 +20,7 @@ import (
 	"github.com/komari-monitor/komari/internal/metricstore"
 	"github.com/komari-monitor/komari/internal/plugin"
 	"github.com/komari-monitor/komari/internal/scheduler"
+	"github.com/komari-monitor/komari/internal/trafficledger"
 	"github.com/komari-monitor/komari/utils/geoip"
 	logger "github.com/komari-monitor/komari/utils/log"
 	"github.com/komari-monitor/komari/utils/notifier"
@@ -65,13 +66,20 @@ func (a *App) registerReloadHandlers(cors *security.CorsController) {
 			}
 			logger.Infof("server", "Using %s as OIDC provider", oidcProvider.Name)
 			if err := oauth.LoadProvider(oidcProvider.Name, oidcProvider.Addition); err != nil {
-				auditlog.EventLog("error", fmt.Sprintf("Failed to load OIDC provider: %v", err))
+				auditlog.EventLog("error", fmt.Sprintf("Failed to load OIDC provider: provider=%s, error=%v", oidcProvider.Name, err))
 			}
 		}
 	})
 	a.reload.Register("geoip-provider", func(event config.ConfigEvent) {
 		if event.IsChanged(config.GeoIpProviderKey) {
 			go geoip.InitGeoIp()
+		}
+	})
+	a.reload.Register("traffic-default-timezone", func(event config.ConfigEvent) {
+		if changed, timezone := config.IsChangedT[string](event, config.TrafficDefaultTimezoneKey); changed {
+			if err := trafficledger.SetDefaultTimezone(timezone); err != nil {
+				logger.Errorf("server", "Failed to refresh traffic ledger timezone: %v", err)
+			}
 		}
 	})
 	a.reload.Register("cors", func(event config.ConfigEvent) { cors.Update(event) })
@@ -127,19 +135,27 @@ func (a *App) Run() error {
 		return fmt.Errorf("listen: %w", err)
 	case reason := <-lifecycle.RestartRequests():
 		logger.Infof("server", "Restarting service for %s", reason)
-		if err := a.Shutdown(); err != nil {
+		if err := a.shutdownWithReason("restart: " + string(reason)); err != nil {
 			logger.Errorf("server", "Cleanup before restart failed: %v", err)
 		}
 		return fmt.Errorf("%w: %s", ErrRestartRequested, reason)
 	case <-quit:
-		return a.Shutdown()
+		return a.shutdownWithReason("signal")
 	}
 }
 
 // Shutdown stops HTTP first, then releases registered resources in LIFO order.
 func (a *App) Shutdown() error {
+	return a.shutdownWithReason("")
+}
+
+func (a *App) shutdownWithReason(reason string) error {
 	if a.dbReady {
-		auditlog.Log("", "", "server is shutting down", "info")
+		msg := fmt.Sprintf("Server shutting down: addr=%s", a.listenAddr)
+		if reason != "" {
+			msg += ", reason=" + reason
+		}
+		auditlog.Log("", "", msg, "info")
 	}
 	httpCtx, cancelHTTP := context.WithTimeout(context.Background(), httpShutdownTimeout)
 	defer cancelHTTP()
@@ -156,7 +172,7 @@ func (a *App) Shutdown() error {
 
 func (a *App) onFatal(err error) {
 	if a.dbReady {
-		auditlog.Log("", "", "server encountered a fatal error: "+err.Error(), "error")
+		auditlog.Log("", "", fmt.Sprintf("Server encountered a fatal error: addr=%s, error=%v", a.listenAddr, err), "error")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), resourceCleanupTimeout)
 	defer cancel()
@@ -192,6 +208,13 @@ func registerScheduledWork() {
 	}
 	if err := scheduler.AddFunc("notifier:traffic", "@every 1m", notifier.CheckTraffic); err != nil {
 		logger.ErrorArgs("server", "Failed to add traffic notification task:", err)
+	}
+	if err := scheduler.AddContextFunc("traffic:flush", "@every 1m", true, func(ctx context.Context) {
+		if err := trafficledger.FlushDirty(ctx); err != nil {
+			logger.Errorf("server", "Failed to flush traffic ledger: %v", err)
+		}
+	}); err != nil {
+		logger.ErrorArgs("server", "Failed to add traffic ledger task:", err)
 	}
 	if err := scheduler.AddFunc("notifier:expire", "0 0 9 * * *", notifier.CheckExpire); err != nil {
 		logger.ErrorArgs("server", "Failed to add expire notification task:", err)

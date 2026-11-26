@@ -1,91 +1,306 @@
 package terminal
 
 import (
-	"encoding/json"
+	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/komari-monitor/komari/database/auditlog"
 	"github.com/komari-monitor/komari/web/connection"
 )
 
+var (
+	terminalPingInterval = 30 * time.Second
+	terminalReadWait     = 75 * time.Second
+	terminalWriteWait    = 10 * time.Second
+)
+
+// startTerminalKeepalive configures WebSocket Ping/Pong keepalive and read
+// deadlines so reverse proxies do not drop idle waiting connections and
+// half-open sockets (e.g. sleeping browser) are detected promptly.
+func startTerminalKeepalive(conn *connection.SafeConn) (stop func(), refreshReadDeadline func()) {
+	if conn == nil {
+		return func() {}, func() {}
+	}
+	readWait := terminalReadWait
+	writeWait := terminalWriteWait
+	pingInterval := terminalPingInterval
+
+	refresh := func() {
+		_ = conn.SetReadDeadline(time.Now().Add(readWait))
+	}
+	refresh()
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(readWait))
+	})
+	conn.SetPingHandler(func(data string) error {
+		if err := conn.SetReadDeadline(time.Now().Add(readWait)); err != nil {
+			return err
+		}
+		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(writeWait))
+	})
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+	}, refresh
+}
+
+// ForwardTerminal pumps frames between the browser and the agent until one of
+// them ends the session. An unexpected break suspends only the broken side and
+// tells the surviving one to wait for a reconnect; an explicit terminate closes
+// the whole session.
+//
+// Each SafeConn spawns at most one reader goroutine across its lifetime: if an
+// older peer ignores abort and stays connected across a reattach, its existing
+// reader simply starts forwarding to the newly attached peer instead of racing
+// a second concurrent ReadMessage on the same gorilla/websocket.Conn.
 func ForwardTerminal(id string, browser, agent *connection.SafeConn) {
 	if browser == nil || agent == nil {
 		return
 	}
+	establishedTime := time.Now().UTC()
 	TerminalSessionsMutex.Lock()
 	session := TerminalSessions[id]
-	requesterIp, userUUID := "", ""
-	if session != nil && session.Browser == browser && session.Agent == agent {
-		requesterIp, userUUID = session.RequesterIp, session.UserUUID
+	requesterIp, userUUID, clientUUID := "", "", ""
+	var (
+		stop         chan struct{}
+		prevDuration time.Duration
+		connects     int
+		startedAt    time.Time
+	)
+	startBrowser, startAgent := false, false
+	// 先核对 RequesterIp 再递增状态：部署在 Unix Socket 或异常反代后时
+	// ClientIP 可能为空，此时必须直接退出，不能让 activeForwarders/auditConnects
+	// 泄漏卡住会话终态审计与后续转发。
+	if session != nil && session.Browser == browser && session.Agent == agent && session.RequesterIp != "" {
+		requesterIp, userUUID, clientUUID = session.RequesterIp, session.UserUUID, session.UUID
+		stopForwardWaitLocked(session)
+		stop = make(chan struct{})
+		session.forwardStop = stop
+		session.activeForwarders++
+		session.auditConnects++
+		if session.auditStartedAt.IsZero() {
+			session.auditStartedAt = establishedTime
+		}
+		prevDuration = session.auditDuration
+		connects = session.auditConnects
+		startedAt = session.auditStartedAt
+		if session.browserPump != browser {
+			session.browserPump = browser
+			startBrowser = true
+		}
+		if session.agentPump != agent {
+			session.agentPump = agent
+			startAgent = true
+		}
 	}
 	TerminalSessionsMutex.Unlock()
 	if requesterIp == "" {
 		return
 	}
 
-	auditlog.Log(requesterIp, userUUID, "established, terminal id:"+id, "terminal")
-	established_time := time.Now()
-	errChan := make(chan error, 1)
+	session.auditMu.Lock()
+	if session.auditClient == "" && clientUUID != "" {
+		session.auditClient = auditlog.FormatClientUUID(clientUUID)
+	}
+	activeMsg := formatTerminalAuditMessage(terminalAuditSnapshot{
+		clientLabel: session.auditClient,
+		terminalID:  id,
+		status:      "active",
+		duration:    prevDuration,
+		connects:    connects,
+		startedAt:   startedAt,
+	})
+	if session.auditLogID == 0 {
+		session.auditLogID = auditlog.LogWithID(requesterIp, userUUID, activeMsg, "terminal")
+	} else {
+		auditlog.UpdateMessage(session.auditLogID, activeMsg)
+	}
+	session.auditMu.Unlock()
 
-	go func() {
-		for {
-			messageType, data, err := browser.ReadMessage()
-			if err != nil {
-				errChan <- err
-				return
+	if startBrowser {
+		go pumpBrowserFrames(id, browser)
+	}
+	if startAgent {
+		go pumpAgentFrames(id, agent)
+	}
+
+	<-stop
+	segmentDuration := time.Since(establishedTime)
+
+	session.auditMu.Lock()
+	TerminalSessionsMutex.Lock()
+	session.auditDuration += segmentDuration
+	if session.activeForwarders > 0 {
+		session.activeForwarders--
+	}
+	remainingForwarders := session.activeForwarders
+	totalDuration := session.auditDuration
+	finalConnects := session.auditConnects
+	finalStarted := session.auditStartedAt
+	stillRetained := TerminalSessions[id] == session
+	endReason := session.auditEndReason
+	TerminalSessionsMutex.Unlock()
+
+	// Only write a suspended/final update if no newer ForwardTerminal took over.
+	if session.auditLogID != 0 && remainingForwarders == 0 {
+		status := "suspended"
+		var endedAt time.Time
+		if !stillRetained {
+			status = endReason
+			if status == "" {
+				status = "closed"
 			}
+			endedAt = time.Now().UTC()
+		}
+		auditlog.UpdateMessage(session.auditLogID, formatTerminalAuditMessage(terminalAuditSnapshot{
+			logID:       session.auditLogID,
+			clientLabel: session.auditClient,
+			terminalID:  id,
+			status:      status,
+			duration:    totalDuration,
+			connects:    finalConnects,
+			startedAt:   finalStarted,
+			endedAt:     endedAt,
+		}))
+	}
+	session.auditMu.Unlock()
+}
 
-			if messageType == websocket.TextMessage {
-				var control struct {
-					Type string `json:"type"`
+func currentAgentForBrowser(id string, browser *connection.SafeConn) (*connection.SafeConn, bool) {
+	TerminalSessionsMutex.Lock()
+	defer TerminalSessionsMutex.Unlock()
+	session := TerminalSessions[id]
+	if session == nil || session.Browser != browser {
+		return nil, false
+	}
+	return session.Agent, true
+}
+
+func currentBrowserForAgent(id string, agent *connection.SafeConn) (*connection.SafeConn, bool) {
+	TerminalSessionsMutex.Lock()
+	defer TerminalSessionsMutex.Unlock()
+	session := TerminalSessions[id]
+	if session == nil || session.Agent != agent {
+		return nil, false
+	}
+	return session.Browser, true
+}
+
+// terminalMaxFrameBytes caps one WebSocket message so a compromised or
+// malfunctioning peer cannot exhaust server memory with a single giant frame.
+const terminalMaxFrameBytes = 1 << 20
+
+func pumpBrowserFrames(id string, browser *connection.SafeConn) {
+	browser.SetReadLimit(terminalMaxFrameBytes)
+	stopKeepalive, refreshReadDeadline := startTerminalKeepalive(browser)
+	defer stopKeepalive()
+
+	for {
+		messageType, data, err := browser.ReadMessage()
+		if err != nil {
+			suspendBrowser(id, browser)
+			return
+		}
+		refreshReadDeadline()
+		if messageType == websocket.TextMessage {
+			if control, ok := parseControl(data); ok {
+				switch control.Type {
+				case controlTypeTerminate, "close":
+					// 浏览器主动结束：closeSession 会把 terminate 转给被控端。
+					// 身份校验保证被替换掉的旧连接的 terminate 不会误关新世代会话。
+					closeSessionIfCurrent(id, browser)
+					return
 				}
-				if json.Unmarshal(data, &control) == nil {
-					if control.Type == "heartbeat" {
-						continue
-					}
-					if control.Type == "close" {
-						_ = agent.WriteJSON(gin.H{"type": "close"})
-						closeSession(id)
-						errChan <- nil
+				agent, active := currentAgentForBrowser(id, browser)
+				if !active {
+					return
+				}
+				if agent == nil {
+					continue
+				}
+				// heartbeat / resize 等控制帧保持文本帧原样透传（保活并支持端到端 RTT，含旧版兼容）。
+				if err = agent.WriteMessage(websocket.TextMessage, data); err != nil {
+					suspendAgent(id, agent)
+				}
+				continue
+			}
+		}
+		agent, active := currentAgentForBrowser(id, browser)
+		if !active {
+			return
+		}
+		if agent == nil {
+			continue
+		}
+		if err = agent.WriteMessage(websocket.BinaryMessage, data); err != nil {
+			suspendAgent(id, agent)
+		}
+	}
+}
+
+func pumpAgentFrames(id string, agent *connection.SafeConn) {
+	agent.SetReadLimit(terminalMaxFrameBytes)
+	stopKeepalive, refreshReadDeadline := startTerminalKeepalive(agent)
+	defer stopKeepalive()
+
+	for {
+		messageType, data, err := agent.ReadMessage()
+		if err != nil {
+			suspendAgent(id, agent)
+			return
+		}
+		refreshReadDeadline()
+		if messageType == websocket.TextMessage {
+			if control, ok := parseControl(data); ok {
+				switch control.Type {
+				case controlTypeTerminate:
+					// 被控端结束（shell 退出等）：closeSession 会转给浏览器。
+					closeSessionIfCurrent(id, agent)
+					return
+				case controlTypeHeartbeat:
+					browser, active := currentBrowserForAgent(id, agent)
+					if !active {
 						return
 					}
+					if browser != nil {
+						if err = browser.WriteMessage(websocket.TextMessage, data); err != nil {
+							suspendBrowser(id, browser)
+						}
+					}
+					continue
 				}
-				if len(data) > 0 && data[0] == '{' {
-					err = agent.WriteMessage(websocket.TextMessage, data)
-				} else {
-					err = agent.WriteMessage(websocket.BinaryMessage, data)
-				}
-			} else {
-				err = agent.WriteMessage(websocket.BinaryMessage, data)
-			}
-
-			if err != nil {
-				errChan <- err
-				return
+				// 未知控制消息：忽略，前向兼容。
+				continue
 			}
 		}
-	}()
-
-	go func() {
-		for {
-			_, data, err := agent.ReadMessage()
-			if err != nil {
-				errChan <- err
-				return
-			}
-			err = browser.WriteMessage(websocket.BinaryMessage, data)
-			if err != nil {
-				errChan <- err
-				return
-			}
+		browser, active := currentBrowserForAgent(id, agent)
+		if !active {
+			return
 		}
-	}()
-
-	// 等待错误或主动关闭
-	<-errChan
-	suspendSession(id, browser, agent)
-	disconnect_time := time.Now()
-	auditlog.Log(requesterIp, userUUID, "disconnected, terminal id:"+id+", duration:"+disconnect_time.Sub(established_time).String(), "terminal")
+		if browser == nil {
+			continue
+		}
+		// 非控制文本帧（如旧版 Agent 的文本报错）按原帧类型转发，其余走二进制。
+		if err = browser.WriteMessage(messageType, data); err != nil {
+			suspendBrowser(id, browser)
+		}
+	}
 }
