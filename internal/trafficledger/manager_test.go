@@ -982,33 +982,12 @@ func TestShutdownFailureCanRetryFinalFlush(t *testing.T) {
 	}
 }
 
-// TestDeleteClientWithRecordIsAtomic verifies that the atomic removal entry
-// deletes the client and ledger together and removes the in-memory entry only
-// after commit.
-func TestDeleteClientWithRecordIsAtomic(t *testing.T) {
-	manager, db := newTestManager(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-	if err := manager.UpdateConfig(ctx, "node-1", UpdateConfigRequest{CycleConfig: monthlyConfig()}, reportPtr("node-1", now, 100, 200, 1000)); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.DeleteClientWithRecord(ctx, "node-1"); err != nil {
-		t.Fatalf("DeleteClientWithRecord: %v", err)
-	}
-	var clientCount, ledgerCount int64
-	if err := db.Model(&models.Client{}).Where("uuid = ?", "node-1").Count(&clientCount).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Model(&models.ClientTrafficLedger{}).Where("uuid = ?", "node-1").Count(&ledgerCount).Error; err != nil {
-		t.Fatal(err)
-	}
-	if clientCount != 0 || ledgerCount != 0 {
-		t.Fatalf("counts after atomic delete = clients %d ledgers %d, want 0/0", clientCount, ledgerCount)
-	}
-	if _, ok := manager.Get("node-1"); ok {
-		t.Fatal("in-memory ledger entry survived atomic delete")
-	}
-}
+// Atomic client+ledger removal is regression-tested end-to-end through the
+// admin:removeClient RPC in web/rpc/jsonrpc/admin.audit_test.go
+// (TestAdminRemoveClientRollsBackOnLedgerHookFailure): a same-package happy
+// path here could never falsify a non-atomic two-step deletion, because a
+// successful delete looks identical whether or not it ran inside one
+// transaction.
 
 // TestSetDefaultTimezoneBackwardShiftPreservesUsage guards the reverse
 // direction of timezone inheritance refresh: moving the inherited timezone

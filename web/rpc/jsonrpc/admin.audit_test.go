@@ -2,6 +2,7 @@ package jsonrpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,9 +10,12 @@ import (
 
 	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/database/models"
+	"github.com/komari-monitor/komari/internal/trafficledger"
 	"github.com/komari-monitor/komari/pkg/rpc"
+	v2 "github.com/komari-monitor/komari/protocol/v2"
 	"github.com/komari-monitor/komari/utils/messageSender"
 	"github.com/komari-monitor/komari/utils/messageSender/webhook"
+	"gorm.io/gorm"
 )
 
 func testAuditContext(ip, userUUID string) context.Context {
@@ -658,5 +662,115 @@ func TestPingAndOfflineNotificationAuditLogsResolveClientNames(t *testing.T) {
 	disableLog := latestAuditLog(t)
 	if !strings.Contains(disableLog.Message, "Disable offline notifications: JP-Osaka("+nodeUUID+")") {
 		t.Fatalf("disableOfflineNotification log missing client label:\n%s", disableLog.Message)
+	}
+}
+
+// TestAdminRemoveClientRollsBackOnLedgerHookFailure is the atomicity regression
+// guard for admin:removeClient. It exercises the unchanged external RPC entry
+// against a cycle-close hook failure: the deletion must commit client row,
+// ledger row and every queued closure in one transaction, so a hook error
+// rolls everything back and leaves the database and the in-memory ledger
+// byte-identical; a non-atomic two-step delete (client row removed first, hook
+// failure afterwards) fails the rollback assertions instead. After the hook
+// is cleared, retrying the same RPC must succeed and remove both rows.
+func TestAdminRemoveClientRollsBackOnLedgerHookFailure(t *testing.T) {
+	ctx := testAuditContext("192.0.2.60", "actor-admin-atomic")
+	if err := trafficledger.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize traffic ledger: %v", err)
+	}
+	db := dbcore.GetDBInstance()
+
+	uuid := "atomic-remove-node"
+	db.Where("uuid = ?", uuid).Delete(&models.Client{})
+	db.Where("uuid = ?", uuid).Delete(&models.ClientTrafficLedger{})
+	t.Cleanup(func() {
+		db.Where("uuid = ?", uuid).Delete(&models.Client{})
+		db.Where("uuid = ?", uuid).Delete(&models.ClientTrafficLedger{})
+	})
+	if err := db.Create(&models.Client{UUID: uuid, Token: "tok-" + uuid, Name: "Atomic Remove Node"}).Error; err != nil {
+		t.Fatalf("seed client: %v", err)
+	}
+
+	// Non-agent ledger entry (monthly, server-side cycle with a non-empty
+	// CycleStartAt) so deleting the client queues a client_deleted cycle close
+	// whose hook write is part of the deletion transaction.
+	now := time.Now().UTC()
+	report := v2.Report{
+		UUID: uuid, UpdatedAt: now, Uptime: 1000,
+		Network: v2.NetworkReport{TotalUp: 100, TotalDown: 200},
+	}
+	if _, rpcErr := adminUpdateClientTrafficConfig(ctx, &rpc.JsonRpcRequest{
+		Version: rpc.RPC_VERSION,
+		Method:  "admin:updateClientTrafficConfig",
+		Params:  map[string]any{"uuid": uuid, "mode": "monthly", "reset_day": 1, "interval_days": 30},
+	}); rpcErr != nil {
+		t.Fatalf("enable monthly mode: %v", rpcErr)
+	}
+	if err := trafficledger.ObserveReport(report); err != nil {
+		t.Fatalf("seed ledger report: %v", err)
+	}
+	preSnap, ok := trafficledger.Get(uuid)
+	if !ok || preSnap.Mode != trafficledger.ModeMonthly || preSnap.CycleStartAt == nil {
+		t.Fatalf("precondition: server-cycle ledger missing: %+v (ok=%v)", preSnap, ok)
+	}
+
+	hookFailure := errors.New("injected cycle close failure")
+	trafficledger.SetCycleCloseHook(func(_ *gorm.DB, _ []trafficledger.ClosedCycleSnapshot) error {
+		return hookFailure
+	})
+	t.Cleanup(func() { trafficledger.SetCycleCloseHook(nil) })
+
+	remove := func() *rpc.JsonRpcError {
+		_, rpcErr := adminRemoveClient(ctx, &rpc.JsonRpcRequest{
+			Version: rpc.RPC_VERSION,
+			Method:  "admin:removeClient",
+			Params:  map[string]any{"uuid": uuid},
+		})
+		return rpcErr
+	}
+
+	// First removal: the hook rejects the close, so the RPC must report the
+	// failure and the transaction must roll back completely.
+	if rpcErr := remove(); rpcErr == nil {
+		t.Fatal("removeClient with failing close hook unexpectedly succeeded: the client row was already deleted before the hook ran")
+	}
+	var clientCount, ledgerCount int64
+	if err := db.Model(&models.Client{}).Where("uuid = ?", uuid).Count(&clientCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.ClientTrafficLedger{}).Where("uuid = ?", uuid).Count(&ledgerCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if clientCount != 1 {
+		t.Fatalf("client row count after rollback = %d, want 1: the deletion was not transactional (non-atomic two-step delete)", clientCount)
+	}
+	if ledgerCount != 1 {
+		t.Fatalf("ledger row count after rollback = %d, want 1", ledgerCount)
+	}
+	postSnap, ok := trafficledger.Get(uuid)
+	if !ok || postSnap.Mode != trafficledger.ModeMonthly {
+		t.Fatalf("in-memory ledger entry lost or degraded after rollback: %+v (ok=%v)", postSnap, ok)
+	}
+	if display := trafficledger.ResolveDisplay(uuid, 0, 0); display.Mode != trafficledger.ModeMonthly {
+		t.Fatalf("display mode after rollback = %q, want monthly: memory entry was cleared before commit", display.Mode)
+	}
+
+	// Second removal with the hook cleared: the same RPC must succeed and
+	// remove both rows.
+	trafficledger.SetCycleCloseHook(nil)
+	if rpcErr := remove(); rpcErr != nil {
+		t.Fatalf("removeClient retry after clearing hook failed: %v", rpcErr)
+	}
+	if err := db.Model(&models.Client{}).Where("uuid = ?", uuid).Count(&clientCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.ClientTrafficLedger{}).Where("uuid = ?", uuid).Count(&ledgerCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if clientCount != 0 || ledgerCount != 0 {
+		t.Fatalf("counts after successful removal = clients %d ledgers %d, want 0/0", clientCount, ledgerCount)
+	}
+	if _, ok := trafficledger.Get(uuid); ok {
+		t.Fatal("in-memory ledger entry survived successful removal")
 	}
 }
